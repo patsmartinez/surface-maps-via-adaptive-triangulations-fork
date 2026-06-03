@@ -1,3 +1,4 @@
+#include <cstdint>
 #ifndef ACG_MATH_MATRIX3X3T_HH_
 #define ACG_MATH_MATRIX3X3T_HH_
 
