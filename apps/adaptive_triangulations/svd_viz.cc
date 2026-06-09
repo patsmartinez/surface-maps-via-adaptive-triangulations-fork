@@ -64,6 +64,50 @@ void write_colored_ply(
 
       ISM_INFO("Wrote " << path);
   }
+  void write_colored_ply_flat(
+      const TriMesh& mesh,
+      const ExternalProperty<FH, Color>& face_colors,
+      const fs::path& path)
+  {
+      std::ofstream file(path);
+
+      int num_verts = mesh.n_faces() * 3;
+      int num_faces = mesh.n_faces();
+
+      file << "ply\n";
+      file << "format ascii 1.0\n";
+      file << "element vertex " << num_verts << "\n";
+      file << "property float x\n";
+      file << "property float y\n";
+      file << "property float z\n";
+      file << "property uchar red\n";
+      file << "property uchar green\n";
+      file << "property uchar blue\n";
+      file << "element face " << num_faces << "\n";
+      file << "property list uchar int vertex_indices\n";
+      file << "end_header\n";
+
+      for (auto fh : mesh.faces()) {
+          Color c = face_colors[fh];
+          int r = (int)(c[0] * 255);
+          int g = (int)(c[1] * 255);
+          int b = (int)(c[2] * 255);
+
+          for (auto vh : fh.vertices()) {
+              auto p = mesh.point(vh);
+              file << p[0] << " " << p[1] << " " << p[2] << " "
+                   << r << " " << g << " " << b << "\n";
+          }
+      }
+
+      int idx = 0;
+      for (size_t i = 0; i < mesh.n_faces(); i++) {
+          file << "3 " << idx << " " << idx+1 << " " << idx+2 << "\n";
+          idx += 3;
+      }
+
+      ISM_INFO("Wrote " << path);
+  }
 
 void visualize_distortion(const TriMesh& mesh_1, const TriMesh& mesh_2)
   {
@@ -92,7 +136,7 @@ void visualize_distortion(const TriMesh& mesh_1, const TriMesh& mesh_2)
     
     auto colors = linear_colors(distortion_metric, min_val, max_val, WHITE, MAGENTA);
 
-    write_colored_ply(mesh_2, colors, OUTPUT_PATH / "distortion.ply");
+    write_colored_ply_flat(mesh_2, colors, OUTPUT_PATH / "distortion_flat.ply");
 }
 
 }
