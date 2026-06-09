@@ -101,8 +101,8 @@ int main()
 {
     // NO GlfwContext needed!
     using namespace SurfaceMaps;
-    TriMesh mesh_1 = read_mesh(DATA_PATH / "meshes/l_shape/l_shape.obj");
-    TriMesh mesh_2 = read_mesh(DATA_PATH / "meshes/l_shape/l_shape_extruded.obj");
+    TriMesh mesh_1 = read_mesh(DATA_PATH / "meshes/l_shape/newL.obj");
+    TriMesh mesh_2 = read_mesh(DATA_PATH / "meshes/l_shape/stretchedL.obj");
 
     visualize_distortion(mesh_1, mesh_2);
 
