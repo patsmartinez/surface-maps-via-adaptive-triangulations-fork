@@ -29,14 +29,10 @@ void visualize_distortion(const TriMesh& mesh_1, const TriMesh& mesh_2){
 
     //view_face_colors(mesh_1, colors);
 
-    //Screenshot instead
-    fs::path output_path = OUTPUT_PATH / "distortion_sdf_vis.png";
     {
-    auto s = screenshot_config(output_path, tg::ivec2(1920, 1080), true);
-    auto style = default_style();
-    gv::view(make_renderable(mesh_2, colors));
+      auto style = default_style();
+      gv::view(make_renderable(mesh_2, colors));
     }
-    ISM_INFO("Screenshot saved to:" << output_path);
 
 }
 }
@@ -51,8 +47,8 @@ int main()
 
     //Load meshes
     TriMesh L_mesh, L_stretched_mesh;
-    read_mesh(DATA_PATH / "meshes/l_shape/l_shape.obj");
-    read_mesh(DATA_PATH / "meshes/l_shape/l_shape_extruded.obj");
+    L_mesh = read_mesh(DATA_PATH / "meshes/l_shape/newL.obj");
+    L_stretched_mesh = read_mesh(DATA_PATH / "meshes/l_shape/stretchedL.obj");
 
     visualize_distortion(L_mesh, L_stretched_mesh);
     return 0;
