@@ -197,23 +197,29 @@ void run()
     // Assign vertices to faces
     assign_vertices_to_T_faces(map_state);
 
-    // Create settings with prescribed Jacobian enabled
-    AdaptiveTriangulationsSettings settings = coarse_phase_settings();
-    settings.use_prescribed_jacobian = true;
-    settings.max_iterations = 100;
-    settings.w_approx = 1.0;
-    settings.w_map = 1.0;
-    settings.w_mesh = 0.5;
-
     // Run landmark phase first to align landmarks
     ISM_INFO("Running landmark phase...");
     TinyAD::Timer timer_landmark("Landmark phase");
     landmark_phase(map_state);
     timer_landmark.stop();
 
-    // Now run the coarse phase with prescribed Jacobian
-    ISM_INFO("Running coarse phase with prescribed Jacobian energy...");
-    TinyAD::Timer timer_coarse("Coarse phase (prescribed Jacobian)");
+    // First, run standard coarse phase to establish a good baseline
+    // This fixes any inverted triangles from the landmark phase
+    ISM_INFO("Running initial coarse phase (standard energy) to establish baseline...");
+    TinyAD::Timer timer_coarse_init("Initial coarse phase");
+    coarse_phase(map_state);
+    timer_coarse_init.stop();
+
+    // Now run with prescribed Jacobian to refine toward the target
+    ISM_INFO("Running prescribed Jacobian refinement...");
+    AdaptiveTriangulationsSettings settings = fine_phase_settings();
+    settings.use_prescribed_jacobian = true;
+    settings.max_iterations = 100;
+    settings.w_approx = 1.0;
+    settings.w_map = 1.0;
+    settings.w_mesh = 0.5;
+
+    TinyAD::Timer timer_coarse("Prescribed Jacobian phase");
     optimize_with_remeshing(map_state, settings);
     timer_coarse.stop();
 
@@ -222,9 +228,9 @@ void run()
     compute_jacobian_residual(map_state, mean_residual, max_residual);
     ISM_INFO("Jacobian residual after coarse phase: mean=" << mean_residual << ", max=" << max_residual);
 
-    // Run fine phase
+    // Run fine phase with smaller approximation error
     ISM_INFO("Running fine phase with prescribed Jacobian energy...");
-    settings = fine_phase_settings();
+    settings = fine_phase_settings(0.0005);  // tighter approx error
     settings.use_prescribed_jacobian = true;
     settings.max_iterations = 50;
 
@@ -265,7 +271,7 @@ void run()
         }
     }
 
-    ISM_INFO("Total run time: " << timer_landmark.seconds() + timer_coarse.seconds() + timer_fine.seconds() << " seconds");
+    ISM_INFO("Total run time: " << timer_landmark.seconds() + timer_coarse_init.seconds() + timer_coarse.seconds() + timer_fine.seconds() << " seconds");
     ISM_INFO("Done!");
 }
 

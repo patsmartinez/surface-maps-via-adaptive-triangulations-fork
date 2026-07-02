@@ -69,10 +69,37 @@ ExternalProperty<FH, PrescribedJacobian> extract_jacobian_field(
         result[fh].sigma = svd.singularValues();
 
         // Get 2D singular vectors
-        Eigen::Vector2d v1_2d = svd.matrixV().col(0);
-        Eigen::Vector2d v2_2d = svd.matrixV().col(1);
-        Eigen::Vector2d u1_2d = svd.matrixU().col(0);
-        Eigen::Vector2d u2_2d = svd.matrixU().col(1);
+        Eigen::Matrix2d U_2d = svd.matrixU();
+        Eigen::Matrix2d V_2d = svd.matrixV();
+
+        // Ensure both U and V are proper rotations (det = +1)
+        // If det(U) < 0, flip the sign of the second column and the second singular value
+        // If det(V) < 0, flip the sign of the second column
+        // This maintains J = U * Sigma * V^T
+        if (U_2d.determinant() < 0) {
+            U_2d.col(1) = -U_2d.col(1);
+            result[fh].sigma[1] = -result[fh].sigma[1];
+        }
+        if (V_2d.determinant() < 0) {
+            V_2d.col(1) = -V_2d.col(1);
+            result[fh].sigma[1] = -result[fh].sigma[1];
+        }
+
+        // After fixing determinants, ensure sigma values are positive
+        // (they should be, since we're dealing with orientation-preserving maps)
+        if (result[fh].sigma[0] < 0) {
+            result[fh].sigma[0] = -result[fh].sigma[0];
+            U_2d.col(0) = -U_2d.col(0);
+        }
+        if (result[fh].sigma[1] < 0) {
+            result[fh].sigma[1] = -result[fh].sigma[1];
+            U_2d.col(1) = -U_2d.col(1);
+        }
+
+        Eigen::Vector2d v1_2d = V_2d.col(0);
+        Eigen::Vector2d v2_2d = V_2d.col(1);
+        Eigen::Vector2d u1_2d = U_2d.col(0);
+        Eigen::Vector2d u2_2d = U_2d.col(1);
 
         // Lift V vectors to 3D (tangent to mesh A)
         result[fh].V.col(0) = v1_2d[0] * basis0_A + v1_2d[1] * basis1_A;
@@ -148,6 +175,37 @@ Eigen::Matrix2<T> lookup_prescribed_jacobian(
         U_local(0, i) = basis0_T_B.dot(u_3d);
         U_local(1, i) = basis1_T_B.dot(u_3d);
     }
+
+    // Orthonormalize U_local and V_local using Gram-Schmidt
+    // This ensures the reconstructed J* has positive determinant
+    // First column stays as-is (normalized), second column is orthogonalized
+    auto orthonormalize = [](Eigen::Matrix2<T>& M) {
+        // Normalize first column
+        T norm0 = sqrt(M(0,0)*M(0,0) + M(1,0)*M(1,0));
+        if (norm0 > T(1e-10)) {
+            M(0,0) /= norm0;
+            M(1,0) /= norm0;
+        }
+        // Orthogonalize second column against first
+        T dot = M(0,0)*M(0,1) + M(1,0)*M(1,1);
+        M(0,1) -= dot * M(0,0);
+        M(1,1) -= dot * M(1,0);
+        // Normalize second column
+        T norm1 = sqrt(M(0,1)*M(0,1) + M(1,1)*M(1,1));
+        if (norm1 > T(1e-10)) {
+            M(0,1) /= norm1;
+            M(1,1) /= norm1;
+        }
+        // Ensure positive determinant (right-handed)
+        T det = M(0,0)*M(1,1) - M(0,1)*M(1,0);
+        if (det < T(0)) {
+            M(0,1) = -M(0,1);
+            M(1,1) = -M(1,1);
+        }
+    };
+
+    orthonormalize(V_local);
+    orthonormalize(U_local);
 
     // Reconstruct J* = U * Sigma * V^T in T-triangle's local coordinates
     Eigen::DiagonalMatrix<T, 2> Sigma(T(pj.sigma[0]), T(pj.sigma[1]));

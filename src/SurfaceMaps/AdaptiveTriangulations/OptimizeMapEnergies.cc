@@ -129,14 +129,20 @@ T map_energy_prescribed(
     const T area_lifted_A = 0.5 * M_A.determinant();
     const T area_lifted_B = 0.5 * M_B.determinant();
 
-    // Don't allow degenerate triangles
+    // Don't allow degenerate or inverted triangles
+    // For inverted triangles, delegate to standard map_energy behavior
     if (area_lifted_A <= 0 || area_lifted_B <= 0)
         return INFINITY;
 
-    // Check for degenerate J*
+    // Check for degenerate J* - use a small threshold for numerical stability
     T det_J_star = _J_star.determinant();
-    if (det_J_star <= 0)
-        return INFINITY;
+    if (det_J_star <= T(1e-10))
+    {
+        // Fall back to standard map energy (J* = I)
+        Eigen::Matrix2<T> J = M_B * M_A.inverse();
+        Eigen::Matrix2<T> J_inv = M_A * M_B.inverse();
+        return area_lifted_B * J.squaredNorm() + area_lifted_A * J_inv.squaredNorm();
+    }
 
     // Compute actual Jacobian J = M_B * M_A^{-1}
     Eigen::Matrix2<T> J = M_B * M_A.inverse();
