@@ -20,6 +20,9 @@ struct AdaptiveTriangulationsSettings
     int max_iterations = 200;
     int optimize_per_remeshing_iters = 1;
 
+    // Prescribed Jacobian mode
+    bool use_prescribed_jacobian = false;
+
     // Weights
     double w_barrier = 1e-4;
     double w_reg = 0.0;

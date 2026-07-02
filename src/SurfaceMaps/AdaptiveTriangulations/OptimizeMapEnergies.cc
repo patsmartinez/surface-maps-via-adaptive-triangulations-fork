@@ -13,6 +13,7 @@
 #include <TinyAD/Utils/Helpers.hh>
 
 #include <SurfaceMaps/AdaptiveTriangulations/AdaptiveTargetEdgeLength.hh>
+#include <SurfaceMaps/AdaptiveTriangulations/PrescribedJacobianField.hh>
 #include <SurfaceMaps/Misc/ConstantCurvatureGeometry.hh>
 
 namespace SurfaceMaps
@@ -93,6 +94,72 @@ T map_energy(
     // Compute area-weighted symmetric Dirichlet energy
     return area_lifted_B * J.squaredNorm() + area_lifted_A * J_inv.squaredNorm();
 }
+
+template double map_energy(const Vec3<double>&, const Vec3<double>&, const Vec3<double>&,
+        const Vec3<double>&, const Vec3<double>&, const Vec3<double>&);
+template TinyAD::Double<12,false> map_energy(const Vec3<TinyAD::Double<12,false>>&, const Vec3<TinyAD::Double<12,false>>&, const Vec3<TinyAD::Double<12,false>>&,
+        const Vec3<TinyAD::Double<12,false>>&, const Vec3<TinyAD::Double<12,false>>&, const Vec3<TinyAD::Double<12,false>>&);
+template TinyAD::Double<12,true> map_energy(const Vec3<TinyAD::Double<12,true>>&, const Vec3<TinyAD::Double<12,true>>&, const Vec3<TinyAD::Double<12,true>>&,
+        const Vec3<TinyAD::Double<12,true>>&, const Vec3<TinyAD::Double<12,true>>&, const Vec3<TinyAD::Double<12,true>>&);
+
+/// Prescribed Jacobian map energy - penalizes deviation from target Jacobian J*
+/// Computes symmetric Dirichlet energy on the residual Jacobian: J_residual = J * J*^{-1}
+template <typename T>
+T map_energy_prescribed(
+        const Vec3<T>& _a_lifted_A,
+        const Vec3<T>& _b_lifted_A,
+        const Vec3<T>& _c_lifted_A,
+        const Vec3<T>& _a_lifted_B,
+        const Vec3<T>& _b_lifted_B,
+        const Vec3<T>& _c_lifted_B,
+        const Eigen::Matrix2<T>& _J_star)
+{
+    // Compute local 2D coordinate systems for lifted T triangles
+    Vec2<T> a_lifted_local_A, b_lifted_local_A, c_lifted_local_A, a_lifted_local_B, b_lifted_local_B, c_lifted_local_B;
+    to_local_coordinates(_a_lifted_A, _b_lifted_A, _c_lifted_A, a_lifted_local_A, b_lifted_local_A, c_lifted_local_A);
+    to_local_coordinates(_a_lifted_B, _b_lifted_B, _c_lifted_B, a_lifted_local_B, b_lifted_local_B, c_lifted_local_B);
+
+    // Matrices with edge vectors as columns
+    Eigen::Matrix2<T> M_A;
+    Eigen::Matrix2<T> M_B;
+    M_A << b_lifted_local_A - a_lifted_local_A, c_lifted_local_A - a_lifted_local_A;
+    M_B << b_lifted_local_B - a_lifted_local_B, c_lifted_local_B - a_lifted_local_B;
+
+    // Compute areas of lifted triangles
+    const T area_lifted_A = 0.5 * M_A.determinant();
+    const T area_lifted_B = 0.5 * M_B.determinant();
+
+    // Don't allow degenerate triangles
+    if (area_lifted_A <= 0 || area_lifted_B <= 0)
+        return INFINITY;
+
+    // Check for degenerate J*
+    T det_J_star = _J_star.determinant();
+    if (det_J_star <= 0)
+        return INFINITY;
+
+    // Compute actual Jacobian J = M_B * M_A^{-1}
+    Eigen::Matrix2<T> J = M_B * M_A.inverse();
+
+    // Compute residual Jacobian: J_residual = J * J*^{-1}
+    // When J = J*, J_residual = I (identity)
+    Eigen::Matrix2<T> J_star_inv = _J_star.inverse();
+    Eigen::Matrix2<T> J_residual = J * J_star_inv;
+
+    // Compute inverse residual: J_residual^{-1} = J* * J^{-1} = J* * M_A * M_B^{-1}
+    Eigen::Matrix2<T> J_residual_inv = _J_star * M_A * M_B.inverse();
+
+    // Symmetric Dirichlet on residual
+    // Note: minimum is at J_residual = I, where ||I||^2_F = 2
+    return area_lifted_B * J_residual.squaredNorm() + area_lifted_A * J_residual_inv.squaredNorm();
+}
+
+template double map_energy_prescribed(const Vec3<double>&, const Vec3<double>&, const Vec3<double>&,
+        const Vec3<double>&, const Vec3<double>&, const Vec3<double>&, const Eigen::Matrix2<double>&);
+template TinyAD::Double<12,false> map_energy_prescribed(const Vec3<TinyAD::Double<12,false>>&, const Vec3<TinyAD::Double<12,false>>&, const Vec3<TinyAD::Double<12,false>>&,
+        const Vec3<TinyAD::Double<12,false>>&, const Vec3<TinyAD::Double<12,false>>&, const Vec3<TinyAD::Double<12,false>>&, const Eigen::Matrix2<TinyAD::Double<12,false>>&);
+template TinyAD::Double<12,true> map_energy_prescribed(const Vec3<TinyAD::Double<12,true>>&, const Vec3<TinyAD::Double<12,true>>&, const Vec3<TinyAD::Double<12,true>>&,
+        const Vec3<TinyAD::Double<12,true>>&, const Vec3<TinyAD::Double<12,true>>&, const Vec3<TinyAD::Double<12,true>>&, const Eigen::Matrix2<TinyAD::Double<12,true>>&);
 
 /// Mesh energy based on symmetric Dirichlet energy to perfect equilateral triangles
 template <typename T>
@@ -360,7 +427,37 @@ T eval_trianglepair_energy_triangle_T(
     T E_map = 0.0;
     if (_settings.w_map > 0.0)
     {
-        E_map += map_energy(a_lifted_A, b_lifted_A, c_lifted_A, a_lifted_B, b_lifted_B, c_lifted_B);
+        if (_settings.use_prescribed_jacobian && !_map_state.prescribed_jacobians.empty())
+        {
+            // Find the pair index for this mesh pair
+            int pair_idx = -1;
+            for (size_t i = 0; i < _map_state.pairs_map_distortion.size(); ++i)
+            {
+                if (_map_state.pairs_map_distortion[i].first == _mesh_A_idx &&
+                    _map_state.pairs_map_distortion[i].second == _mesh_B_idx)
+                {
+                    pair_idx = static_cast<int>(i);
+                    break;
+                }
+            }
+            ISM_ASSERT_GEQ(pair_idx, 0);
+
+            // Look up the prescribed Jacobian for this T-triangle
+            Eigen::Matrix2<T> J_star = lookup_prescribed_jacobian(
+                _a_sphere_A, _b_sphere_A, _c_sphere_A,
+                a_lifted_A, b_lifted_A, c_lifted_A,
+                a_lifted_B, b_lifted_B, c_lifted_B,
+                pair_idx, _map_state);
+
+            // Compute prescribed map energy
+            E_map += map_energy_prescribed(a_lifted_A, b_lifted_A, c_lifted_A,
+                                           a_lifted_B, b_lifted_B, c_lifted_B, J_star);
+        }
+        else
+        {
+            // Standard symmetric Dirichlet energy
+            E_map += map_energy(a_lifted_A, b_lifted_A, c_lifted_A, a_lifted_B, b_lifted_B, c_lifted_B);
+        }
 
         ISM_ASSERT_NOT_NAN(E_map);
         if (E_map == INFINITY)

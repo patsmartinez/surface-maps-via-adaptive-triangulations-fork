@@ -109,6 +109,7 @@ void write_colored_ply(
       ISM_INFO("Wrote " << path);
   }
 
+  
 void visualize_distortion(const TriMesh& mesh_1, const TriMesh& mesh_2)
   {
     ISM_INFO("Mesh 1: " << mesh_1.n_vertices() << " verts, " << mesh_1.n_faces() << " faces");

@@ -23,6 +23,24 @@ enum class DistortionPairs
     Star,
 };
 
+/// Stores the prescribed Jacobian field for a face of an input mesh.
+/// The Jacobian describes the map from mesh A to mesh B.
+/// We store the SVD components in 3D ambient space to allow proper
+/// projection into arbitrary T-triangle local coordinate systems.
+struct PrescribedJacobian
+{
+    // Right singular vectors (3D, tangent to surface A)
+    // V columns define the principal directions on mesh A
+    Eigen::Matrix<double, 3, 2> V;
+
+    // Left singular vectors (3D, tangent to surface B)
+    // U columns define the principal directions on mesh B
+    Eigen::Matrix<double, 3, 2> U;
+
+    // Singular values (sigma[0] >= sigma[1] > 0)
+    Eigen::Vector2d sigma;
+};
+
 struct MapState
 {
     MapState() = default;
@@ -37,7 +55,8 @@ struct MapState
           tels_input(_other.tels_input),
           maps_Tf_inputvs(_other.maps_Tf_inputvs),
           vertex_areas_input(_other.vertex_areas_input),
-          meshes_embeddings_input(_other.meshes_embeddings_input)
+          meshes_embeddings_input(_other.meshes_embeddings_input),
+          prescribed_jacobians(_other.prescribed_jacobians)
     {
         compute_bsp_trees();
     }
@@ -71,6 +90,11 @@ struct MapState
     std::vector<std::pair<int, int>> pairs_map_distortion;
 
     std::vector<ExternalProperty<VH, bool>> active_for_approx; // Specifies if a vertex should be considered for the surface approximation term, if not initialized for all meshes use all vertices by default
+
+    // Prescribed Jacobian field per mesh pair.
+    // Outer index: pair index (matching pairs_map_distortion).
+    // Inner index: face index of the first mesh (A) in that pair.
+    std::vector<ExternalProperty<FH, PrescribedJacobian>> prescribed_jacobians;
 };
 
 // Returns a BarycentricPoint on target mesh.

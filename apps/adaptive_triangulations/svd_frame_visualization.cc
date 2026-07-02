@@ -14,8 +14,8 @@
 
   void run()
   {
-      TriMesh mesh_A = read_mesh(DATA_PATH / "meshes/l_shape/l_shape.obj");
-      TriMesh mesh_B = read_mesh(DATA_PATH / "meshes/l_shape/l_shape_extruded.obj");
+      TriMesh mesh_A = read_mesh(DATA_PATH / "meshes/l_shape/newL.obj");
+      TriMesh mesh_B = read_mesh(DATA_PATH / "meshes/l_shape/stretchedL.obj");
 
       // Storage
       ExternalProperty<FH, double> sing_vals_max(mesh_A);

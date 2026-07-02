@@ -48,6 +48,29 @@ T eval_singlemesh_energy_triangle_T(
         const std::vector<SVH>& _vhs_A, // A vertices in triangle of T
         const AdaptiveTriangulationsSettings& _settings);
 
+/// Standard symmetric Dirichlet map energy
+template <typename T>
+T map_energy(
+        const Vec3<T>& _a_lifted_A,
+        const Vec3<T>& _b_lifted_A,
+        const Vec3<T>& _c_lifted_A,
+        const Vec3<T>& _a_lifted_B,
+        const Vec3<T>& _b_lifted_B,
+        const Vec3<T>& _c_lifted_B);
+
+/// Prescribed Jacobian map energy - penalizes deviation from target Jacobian J*
+/// Computes symmetric Dirichlet energy on the residual Jacobian: J_residual = J * J*^{-1}
+/// When J = J*, J_residual = I and the energy is minimal.
+template <typename T>
+T map_energy_prescribed(
+        const Vec3<T>& _a_lifted_A,
+        const Vec3<T>& _b_lifted_A,
+        const Vec3<T>& _c_lifted_A,
+        const Vec3<T>& _a_lifted_B,
+        const Vec3<T>& _b_lifted_B,
+        const Vec3<T>& _c_lifted_B,
+        const Eigen::Matrix2<T>& _J_star);
+
 /// Evaluate energy that concerns pair of triangles on two meshes for a triangle of mesh T (i.e., map energy)
 template <typename T>
 T eval_trianglepair_energy_triangle_T(
