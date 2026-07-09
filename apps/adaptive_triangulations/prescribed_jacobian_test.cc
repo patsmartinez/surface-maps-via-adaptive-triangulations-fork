@@ -210,28 +210,35 @@ void run()
     coarse_phase(map_state);
     timer_coarse_init.stop();
 
-    // Now run with prescribed Jacobian to refine toward the target
-    ISM_INFO("Running prescribed Jacobian refinement...");
+    // Stage 1: continuous phase only, no remeshing.
+    // mesh_T is initialized as a copy of mesh A, so T's triangles coincide with A's
+    // and the prescribed field lookup is trivial.
+    ISM_INFO("Running prescribed Jacobian phase (metric form, remeshing disabled)...");
     AdaptiveTriangulationsSettings settings = fine_phase_settings();
     settings.use_prescribed_jacobian = true;
+    settings.allow_splits = false;
+    settings.allow_collapses = false;
+    settings.allow_flips = false;
+    settings.w_mesh = 0.0; // No remeshing, so no need for the equilateral quality term
     settings.max_iterations = 100;
     settings.w_approx = 1.0;
     settings.w_map = 1.0;
-    settings.w_mesh = 0.5;
 
-    TinyAD::Timer timer_coarse("Prescribed Jacobian phase");
+    TinyAD::Timer timer_coarse("Prescribed Jacobian phase (continuous only)");
     optimize_with_remeshing(map_state, settings);
     timer_coarse.stop();
 
     // Compute and print residual
     double mean_residual, max_residual;
     compute_jacobian_residual(map_state, mean_residual, max_residual);
-    ISM_INFO("Jacobian residual after coarse phase: mean=" << mean_residual << ", max=" << max_residual);
+    ISM_INFO("Jacobian residual after continuous phase: mean=" << mean_residual << ", max=" << max_residual);
 
-    // Run fine phase with smaller approximation error
-    ISM_INFO("Running fine phase with prescribed Jacobian energy...");
+    // Stage 2: enable remeshing with a lowered mesh weight, since the equilateral
+    // target of E_mesh fights the prescribed anisotropy.
+    ISM_INFO("Running fine phase with prescribed Jacobian energy (remeshing enabled)...");
     settings = fine_phase_settings(0.0005);  // tighter approx error
     settings.use_prescribed_jacobian = true;
+    settings.w_mesh = 0.1;
     settings.max_iterations = 50;
 
     TinyAD::Timer timer_fine("Fine phase (prescribed Jacobian)");

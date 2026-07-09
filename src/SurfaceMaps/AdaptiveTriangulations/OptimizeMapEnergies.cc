@@ -167,6 +167,64 @@ template TinyAD::Double<12,false> map_energy_prescribed(const Vec3<TinyAD::Doubl
 template TinyAD::Double<12,true> map_energy_prescribed(const Vec3<TinyAD::Double<12,true>>&, const Vec3<TinyAD::Double<12,true>>&, const Vec3<TinyAD::Double<12,true>>&,
         const Vec3<TinyAD::Double<12,true>>&, const Vec3<TinyAD::Double<12,true>>&, const Vec3<TinyAD::Double<12,true>>&, const Eigen::Matrix2<TinyAD::Double<12,true>>&);
 
+/// Metric form of the prescribed Jacobian map energy.
+/// Prescribes only the pullback metric M* = V * Sigma^2 * V^T; the left singular vectors U
+/// never enter (Frobenius norms are invariant to rotations), so no projection onto mesh B is needed.
+template <typename T>
+T map_energy_prescribed_metric(
+        const Vec3<T>& _a_lifted_A,
+        const Vec3<T>& _b_lifted_A,
+        const Vec3<T>& _c_lifted_A,
+        const Vec3<T>& _a_lifted_B,
+        const Vec3<T>& _b_lifted_B,
+        const Vec3<T>& _c_lifted_B,
+        const Eigen::Matrix2<T>& _V_local,
+        const Eigen::Vector2d& _sigma)
+{
+    // Compute local 2D coordinate systems for lifted T triangles
+    Vec2<T> a_lifted_local_A, b_lifted_local_A, c_lifted_local_A, a_lifted_local_B, b_lifted_local_B, c_lifted_local_B;
+    to_local_coordinates(_a_lifted_A, _b_lifted_A, _c_lifted_A, a_lifted_local_A, b_lifted_local_A, c_lifted_local_A);
+    to_local_coordinates(_a_lifted_B, _b_lifted_B, _c_lifted_B, a_lifted_local_B, b_lifted_local_B, c_lifted_local_B);
+
+    // Matrices with edge vectors as columns
+    Eigen::Matrix2<T> M_A;
+    Eigen::Matrix2<T> M_B;
+    M_A << b_lifted_local_A - a_lifted_local_A, c_lifted_local_A - a_lifted_local_A;
+    M_B << b_lifted_local_B - a_lifted_local_B, c_lifted_local_B - a_lifted_local_B;
+
+    // Compute areas of lifted triangles
+    const T area_lifted_A = 0.5 * M_A.determinant();
+    const T area_lifted_B = 0.5 * M_B.determinant();
+
+    // Don't allow degenerate or inverted triangles
+    if (area_lifted_A <= 0 || area_lifted_B <= 0)
+        return INFINITY;
+
+    // Compute map jacobian and its inverse
+    Eigen::Matrix2<T> J = M_B * M_A.inverse();
+    Eigen::Matrix2<T> J_inv = M_A * M_B.inverse();
+
+    // Check for degenerate prescription - fall back to standard map energy (M* = I)
+    if (_sigma.minCoeff() <= 1e-6)
+        return area_lifted_B * J.squaredNorm() + area_lifted_A * J_inv.squaredNorm();
+
+    // Symmetric Dirichlet on the metric residual:
+    // ||J V Sigma^{-1}||^2 = tr(J M*^{-1} J^T), ||Sigma V^T J^{-1}||^2 = tr(J^{-1} J^{-T} M*)
+    // Minimum at J^T J = M*, where the residual is a rotation and each norm is 2.
+    Eigen::DiagonalMatrix<T, 2> Sigma{T(_sigma[0]), T(_sigma[1])};
+    Eigen::DiagonalMatrix<T, 2> Sigma_inv{T(1.0 / _sigma[0]), T(1.0 / _sigma[1])};
+
+    return area_lifted_B * (J * _V_local * Sigma_inv).squaredNorm()
+         + area_lifted_A * (Sigma * _V_local.transpose() * J_inv).squaredNorm();
+}
+
+template double map_energy_prescribed_metric(const Vec3<double>&, const Vec3<double>&, const Vec3<double>&,
+        const Vec3<double>&, const Vec3<double>&, const Vec3<double>&, const Eigen::Matrix2<double>&, const Eigen::Vector2d&);
+template TinyAD::Double<12,false> map_energy_prescribed_metric(const Vec3<TinyAD::Double<12,false>>&, const Vec3<TinyAD::Double<12,false>>&, const Vec3<TinyAD::Double<12,false>>&,
+        const Vec3<TinyAD::Double<12,false>>&, const Vec3<TinyAD::Double<12,false>>&, const Vec3<TinyAD::Double<12,false>>&, const Eigen::Matrix2<TinyAD::Double<12,false>>&, const Eigen::Vector2d&);
+template TinyAD::Double<12,true> map_energy_prescribed_metric(const Vec3<TinyAD::Double<12,true>>&, const Vec3<TinyAD::Double<12,true>>&, const Vec3<TinyAD::Double<12,true>>&,
+        const Vec3<TinyAD::Double<12,true>>&, const Vec3<TinyAD::Double<12,true>>&, const Vec3<TinyAD::Double<12,true>>&, const Eigen::Matrix2<TinyAD::Double<12,true>>&, const Eigen::Vector2d&);
+
 /// Mesh energy based on symmetric Dirichlet energy to perfect equilateral triangles
 template <typename T>
 T mesh_energy(
@@ -448,16 +506,32 @@ T eval_trianglepair_energy_triangle_T(
             }
             ISM_ASSERT_GEQ(pair_idx, 0);
 
-            // Look up the prescribed Jacobian for this T-triangle
-            Eigen::Matrix2<T> J_star = lookup_prescribed_jacobian(
-                _a_sphere_A, _b_sphere_A, _c_sphere_A,
-                a_lifted_A, b_lifted_A, c_lifted_A,
-                a_lifted_B, b_lifted_B, c_lifted_B,
-                pair_idx, _map_state);
+            if (_settings.prescribed_metric_form)
+            {
+                // Metric form: only V and sigma are needed, U is irrelevant to the energy
+                Eigen::Matrix2<T> V_local;
+                Eigen::Vector2d sigma;
+                lookup_prescribed_metric(
+                    _a_sphere_A, _b_sphere_A, _c_sphere_A,
+                    a_lifted_A, b_lifted_A, c_lifted_A,
+                    pair_idx, _map_state, V_local, sigma);
 
-            // Compute prescribed map energy
-            E_map += map_energy_prescribed(a_lifted_A, b_lifted_A, c_lifted_A,
-                                           a_lifted_B, b_lifted_B, c_lifted_B, J_star);
+                E_map += map_energy_prescribed_metric(a_lifted_A, b_lifted_A, c_lifted_A,
+                                                      a_lifted_B, b_lifted_B, c_lifted_B, V_local, sigma);
+            }
+            else
+            {
+                // Look up the prescribed Jacobian for this T-triangle
+                Eigen::Matrix2<T> J_star = lookup_prescribed_jacobian(
+                    _a_sphere_A, _b_sphere_A, _c_sphere_A,
+                    a_lifted_A, b_lifted_A, c_lifted_A,
+                    a_lifted_B, b_lifted_B, c_lifted_B,
+                    pair_idx, _map_state);
+
+                // Compute prescribed map energy
+                E_map += map_energy_prescribed(a_lifted_A, b_lifted_A, c_lifted_A,
+                                               a_lifted_B, b_lifted_B, c_lifted_B, J_star);
+            }
         }
         else
         {

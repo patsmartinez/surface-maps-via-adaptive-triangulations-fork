@@ -22,6 +22,7 @@ struct AdaptiveTriangulationsSettings
 
     // Prescribed Jacobian mode
     bool use_prescribed_jacobian = false;
+    bool prescribed_metric_form = true; // Metric form (V, sigma only, U ignored); false = full J* residual
 
     // Weights
     double w_barrier = 1e-4;

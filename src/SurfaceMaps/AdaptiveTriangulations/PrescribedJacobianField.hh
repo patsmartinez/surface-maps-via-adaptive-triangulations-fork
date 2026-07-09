@@ -51,4 +51,29 @@ Eigen::Matrix2<T> lookup_prescribed_jacobian(
         const int _pair_idx,
         const MapState& _map_state);
 
+/// Look up the prescribed pullback metric M* = V * Sigma^2 * V^T for a T-triangle.
+/// Only the right singular vectors V (tangent to mesh A) and the singular values are needed;
+/// the left singular vectors U are irrelevant to the metric form of the prescribed energy.
+/// Finds the face of mesh A that contains the T-triangle centroid on the sphere,
+/// then projects the 3D V vectors into the T-triangle's local coordinate system on A.
+///
+/// @param _a_sphere, _b_sphere, _c_sphere T-triangle vertices on sphere
+/// @param _a_lifted_A, _b_lifted_A, _c_lifted_A T-triangle vertices lifted to mesh A
+/// @param _pair_idx Index into pairs_map_distortion / prescribed_jacobians
+/// @param _map_state The map state containing meshes and prescribed jacobians
+/// @param _V_local Output: 2x2 rotation with V in T-triangle's local coordinates on A
+/// @param _sigma Output: singular values
+template <typename T>
+void lookup_prescribed_metric(
+        const Vec3<T>& _a_sphere,
+        const Vec3<T>& _b_sphere,
+        const Vec3<T>& _c_sphere,
+        const Vec3<T>& _a_lifted_A,
+        const Vec3<T>& _b_lifted_A,
+        const Vec3<T>& _c_lifted_A,
+        const int _pair_idx,
+        const MapState& _map_state,
+        Eigen::Matrix2<T>& _V_local,
+        Eigen::Vector2d& _sigma);
+
 }

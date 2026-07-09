@@ -13,6 +13,35 @@
 namespace SurfaceMaps
 {
 
+/// Orthonormalize a 2x2 matrix using Gram-Schmidt and ensure positive determinant.
+/// Used to restore rotations after projecting 3D singular vectors into a tangent frame.
+template <typename T>
+static void orthonormalize_2x2(Eigen::Matrix2<T>& M)
+{
+    // Normalize first column
+    T norm0 = sqrt(M(0,0)*M(0,0) + M(1,0)*M(1,0));
+    if (norm0 > T(1e-10)) {
+        M(0,0) /= norm0;
+        M(1,0) /= norm0;
+    }
+    // Orthogonalize second column against first
+    T dot = M(0,0)*M(0,1) + M(1,0)*M(1,1);
+    M(0,1) -= dot * M(0,0);
+    M(1,1) -= dot * M(1,0);
+    // Normalize second column
+    T norm1 = sqrt(M(0,1)*M(0,1) + M(1,1)*M(1,1));
+    if (norm1 > T(1e-10)) {
+        M(0,1) /= norm1;
+        M(1,1) /= norm1;
+    }
+    // Ensure positive determinant (right-handed)
+    T det = M(0,0)*M(1,1) - M(0,1)*M(1,0);
+    if (det < T(0)) {
+        M(0,1) = -M(0,1);
+        M(1,1) = -M(1,1);
+    }
+}
+
 ExternalProperty<FH, PrescribedJacobian> extract_jacobian_field(
         const TriMesh& mesh_A,
         const TriMesh& mesh_B)
@@ -178,40 +207,67 @@ Eigen::Matrix2<T> lookup_prescribed_jacobian(
 
     // Orthonormalize U_local and V_local using Gram-Schmidt
     // This ensures the reconstructed J* has positive determinant
-    // First column stays as-is (normalized), second column is orthogonalized
-    auto orthonormalize = [](Eigen::Matrix2<T>& M) {
-        // Normalize first column
-        T norm0 = sqrt(M(0,0)*M(0,0) + M(1,0)*M(1,0));
-        if (norm0 > T(1e-10)) {
-            M(0,0) /= norm0;
-            M(1,0) /= norm0;
-        }
-        // Orthogonalize second column against first
-        T dot = M(0,0)*M(0,1) + M(1,0)*M(1,1);
-        M(0,1) -= dot * M(0,0);
-        M(1,1) -= dot * M(1,0);
-        // Normalize second column
-        T norm1 = sqrt(M(0,1)*M(0,1) + M(1,1)*M(1,1));
-        if (norm1 > T(1e-10)) {
-            M(0,1) /= norm1;
-            M(1,1) /= norm1;
-        }
-        // Ensure positive determinant (right-handed)
-        T det = M(0,0)*M(1,1) - M(0,1)*M(1,0);
-        if (det < T(0)) {
-            M(0,1) = -M(0,1);
-            M(1,1) = -M(1,1);
-        }
-    };
-
-    orthonormalize(V_local);
-    orthonormalize(U_local);
+    orthonormalize_2x2(V_local);
+    orthonormalize_2x2(U_local);
 
     // Reconstruct J* = U * Sigma * V^T in T-triangle's local coordinates
     Eigen::DiagonalMatrix<T, 2> Sigma(T(pj.sigma[0]), T(pj.sigma[1]));
     Eigen::Matrix2<T> J_star = U_local * Sigma * V_local.transpose();
 
     return J_star;
+}
+
+template <typename T>
+void lookup_prescribed_metric(
+        const Vec3<T>& _a_sphere,
+        const Vec3<T>& _b_sphere,
+        const Vec3<T>& _c_sphere,
+        const Vec3<T>& _a_lifted_A,
+        const Vec3<T>& _b_lifted_A,
+        const Vec3<T>& _c_lifted_A,
+        const int _pair_idx,
+        const MapState& _map_state,
+        Eigen::Matrix2<T>& _V_local,
+        Eigen::Vector2d& _sigma)
+{
+    // Get the mesh pair indices
+    const int mesh_A_idx = _map_state.pairs_map_distortion[_pair_idx].first;
+
+    // Compute centroid of T-triangle on sphere (use passive values for lookup)
+    Vec3d centroid_sphere = (TinyAD::to_passive(_a_sphere) +
+                             TinyAD::to_passive(_b_sphere) +
+                             TinyAD::to_passive(_c_sphere)) / 3.0;
+    centroid_sphere.normalize();
+
+    // Find the face of mesh A's embedding that contains the centroid
+    SFH containing_face;
+    double alpha, beta, gamma;
+    bsp_tree_barys_face(centroid_sphere,
+                        _map_state.meshes_embeddings_input[mesh_A_idx],
+                        _map_state.bsp_embeddings_input[mesh_A_idx],
+                        alpha, beta, gamma, containing_face);
+
+    // Get the prescribed Jacobian for this face
+    const PrescribedJacobian& pj = _map_state.prescribed_jacobians[_pair_idx][containing_face];
+
+    // Compute local basis for T-triangle on mesh A surface
+    Vec3<T> normal_T_A = ((_b_lifted_A - _a_lifted_A).cross(_c_lifted_A - _a_lifted_A)).normalized();
+    Vec3<T> basis0_T_A = (_b_lifted_A - _a_lifted_A).normalized();
+    Vec3<T> basis1_T_A = normal_T_A.cross(basis0_T_A);
+
+    // Project V vectors (from mesh A) into T-triangle's local basis on A
+    // V is 3x2, we need to project each column
+    for (int i = 0; i < 2; ++i)
+    {
+        Vec3d v_3d = pj.V.col(i);
+        _V_local(0, i) = basis0_T_A.dot(v_3d);
+        _V_local(1, i) = basis1_T_A.dot(v_3d);
+    }
+
+    // Orthonormalize V_local so that M* = V * Sigma^2 * V^T is consistent with sigma
+    orthonormalize_2x2(_V_local);
+
+    _sigma = pj.sigma;
 }
 
 // Explicit template instantiations
@@ -232,5 +288,23 @@ template Eigen::Matrix2<TinyAD::Double<12,true>> lookup_prescribed_jacobian(
         const Vec3<TinyAD::Double<12,true>>&, const Vec3<TinyAD::Double<12,true>>&, const Vec3<TinyAD::Double<12,true>>&,
         const Vec3<TinyAD::Double<12,true>>&, const Vec3<TinyAD::Double<12,true>>&, const Vec3<TinyAD::Double<12,true>>&,
         const int, const MapState&);
+
+template void lookup_prescribed_metric(
+        const Vec3<double>&, const Vec3<double>&, const Vec3<double>&,
+        const Vec3<double>&, const Vec3<double>&, const Vec3<double>&,
+        const int, const MapState&,
+        Eigen::Matrix2<double>&, Eigen::Vector2d&);
+
+template void lookup_prescribed_metric(
+        const Vec3<TinyAD::Double<12,false>>&, const Vec3<TinyAD::Double<12,false>>&, const Vec3<TinyAD::Double<12,false>>&,
+        const Vec3<TinyAD::Double<12,false>>&, const Vec3<TinyAD::Double<12,false>>&, const Vec3<TinyAD::Double<12,false>>&,
+        const int, const MapState&,
+        Eigen::Matrix2<TinyAD::Double<12,false>>&, Eigen::Vector2d&);
+
+template void lookup_prescribed_metric(
+        const Vec3<TinyAD::Double<12,true>>&, const Vec3<TinyAD::Double<12,true>>&, const Vec3<TinyAD::Double<12,true>>&,
+        const Vec3<TinyAD::Double<12,true>>&, const Vec3<TinyAD::Double<12,true>>&, const Vec3<TinyAD::Double<12,true>>&,
+        const int, const MapState&,
+        Eigen::Matrix2<TinyAD::Double<12,true>>&, Eigen::Vector2d&);
 
 }

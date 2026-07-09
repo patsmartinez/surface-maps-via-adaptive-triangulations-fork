@@ -71,6 +71,23 @@ T map_energy_prescribed(
         const Vec3<T>& _c_lifted_B,
         const Eigen::Matrix2<T>& _J_star);
 
+/// Metric form of the prescribed Jacobian map energy.
+/// Prescribes only the pullback metric M* = V * Sigma^2 * V^T (i.e., J^T J), not the full Jacobian:
+/// E = area_B * tr(J M*^{-1} J^T) + area_A * tr(J^{-1} J^{-T} M*)
+/// computed in the factored form area_B * ||J V Sigma^{-1}||^2 + area_A * ||Sigma V^T J^{-1}||^2.
+/// Identical energy landscape to map_energy_prescribed (Frobenius norms are invariant to U),
+/// but the left singular vectors U are never needed.
+template <typename T>
+T map_energy_prescribed_metric(
+        const Vec3<T>& _a_lifted_A,
+        const Vec3<T>& _b_lifted_A,
+        const Vec3<T>& _c_lifted_A,
+        const Vec3<T>& _a_lifted_B,
+        const Vec3<T>& _b_lifted_B,
+        const Vec3<T>& _c_lifted_B,
+        const Eigen::Matrix2<T>& _V_local,
+        const Eigen::Vector2d& _sigma);
+
 /// Evaluate energy that concerns pair of triangles on two meshes for a triangle of mesh T (i.e., map energy)
 template <typename T>
 T eval_trianglepair_energy_triangle_T(
