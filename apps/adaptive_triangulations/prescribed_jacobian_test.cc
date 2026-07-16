@@ -95,13 +95,18 @@ void validate_jacobian_field(
     ISM_ASSERT_L(max_error, 1e-8);
 }
 
-/// Compute the actual and prescribed Jacobians of a single T-face.
-/// Returns false if the face is degenerate on either surface or J* is near-singular.
-bool compute_T_face_jacobians(
+/// Compute the actual Jacobian and the prescribed metric (V, sigma) of a single T-face.
+/// Deliberately U-free: it uses the same lookup as the metric energy, so it keeps working
+/// when the triangle's tangent plane on B differs from the plane the U vectors were
+/// stored in (e.g., material that slid across a crease) - the legacy full-J* lookup
+/// degenerates there. Returns false if the face is degenerate on either surface or the
+/// prescription is near-singular.
+bool compute_T_face_metric(
         const MapState& map_state,
         const FH fh,
         Eigen::Matrix2d& J_actual,
-        Eigen::Matrix2d& J_star)
+        Eigen::Matrix2d& V_local,
+        Eigen::Vector2d& sigma)
 {
     ISM_ASSERT_EQ(map_state.pairs_map_distortion.size(), 1);
     const int mesh_A_idx = map_state.pairs_map_distortion[0].first;
@@ -146,14 +151,14 @@ bool compute_T_face_jacobians(
 
     J_actual = M_B * M_A.inverse();
 
-    // Look up prescribed Jacobian
-    J_star = lookup_prescribed_jacobian(
+    // Look up the prescribed metric (V tangent to A and sigma; U is never needed)
+    lookup_prescribed_metric(
         a_sphere, b_sphere, c_sphere,
         a_lifted_A, b_lifted_A, c_lifted_A,
-        a_lifted_B, b_lifted_B, c_lifted_B,
-        0, map_state);
+        0, map_state, V_local, sigma);
 
-    if (std::abs(J_star.determinant()) <= 1e-10)
+    // Same degeneracy guard as the metric energy
+    if (sigma.minCoeff() <= 1e-6)
         return false;
 
     return true;
@@ -183,12 +188,15 @@ void compute_metric_residual(
     // For each face of T
     for (auto fh : map_state.mesh_T.faces())
     {
-        Eigen::Matrix2d J_actual, J_star;
-        if (!compute_T_face_jacobians(map_state, fh, J_actual, J_star))
+        Eigen::Matrix2d J_actual, V_local;
+        Eigen::Vector2d sigma;
+        if (!compute_T_face_metric(map_state, fh, J_actual, V_local, sigma))
             continue;
 
-        // Singular values of the residual J * J*^{-1}: both 1 iff the metric matches
-        Eigen::JacobiSVD<Eigen::Matrix2d> svd(J_actual * J_star.inverse());
+        // Singular values of the residual J * J*^{-1}: both 1 iff the metric matches.
+        // U drops out of singular values, so J * V * Sigma^{-1} gives the same spectrum.
+        const Eigen::Matrix2d residual = J_actual * V_local * Eigen::Vector2d(1.0 / sigma[0], 1.0 / sigma[1]).asDiagonal();
+        Eigen::JacobiSVD<Eigen::Matrix2d> svd(residual);
         const double dev = std::max(std::abs(svd.singularValues()[0] - 1.0),
                                     std::abs(svd.singularValues()[1] - 1.0));
 
@@ -471,15 +479,16 @@ void run()
                 ImGui::Begin("Selected triangle");
                 ImGui::Text("T-face %d", selected_face);
 
-                Eigen::Matrix2d J_actual, J_star;
-                if (compute_T_face_jacobians(map_state, fh, J_actual, J_star))
+                Eigen::Matrix2d J_actual, V_local;
+                Eigen::Vector2d sigma;
+                if (compute_T_face_metric(map_state, fh, J_actual, V_local, sigma))
                 {
                     const Eigen::Vector2d s_actual = Eigen::JacobiSVD<Eigen::Matrix2d>(J_actual).singularValues();
-                    const Eigen::Vector2d s_target = Eigen::JacobiSVD<Eigen::Matrix2d>(J_star).singularValues();
-                    const Eigen::Vector2d s_residual = Eigen::JacobiSVD<Eigen::Matrix2d>(J_actual * J_star.inverse()).singularValues();
+                    const Eigen::Matrix2d residual = J_actual * V_local * Eigen::Vector2d(1.0 / sigma[0], 1.0 / sigma[1]).asDiagonal();
+                    const Eigen::Vector2d s_residual = Eigen::JacobiSVD<Eigen::Matrix2d>(residual).singularValues();
 
                     ImGui::Text("sigma(J) actual:      %.4f  %.4f", s_actual[0], s_actual[1]);
-                    ImGui::Text("sigma(J*) prescribed: %.4f  %.4f", s_target[0], s_target[1]);
+                    ImGui::Text("sigma(J*) prescribed: %.4f  %.4f", sigma[0], sigma[1]);
                     ImGui::Separator();
                     ImGui::Text("sigma(J J*^-1):       %.4f  %.4f", s_residual[0], s_residual[1]);
                     ImGui::Text("deviation from 1:     %.4f",
@@ -487,7 +496,7 @@ void run()
                 }
                 else
                 {
-                    ImGui::Text("Degenerate triangle or prescription.");
+                    ImGui::Text("Degenerate triangle (inverted on A or B) or singular prescription.");
                 }
                 ImGui::End();
             }
