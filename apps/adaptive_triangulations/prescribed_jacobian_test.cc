@@ -26,6 +26,9 @@
 
 #include <Eigen/SVD>
 #include <TinyAD/Utils/Timer.hh>
+#include <glow-extras/viewer/canvas.hh>
+#include <glow-extras/viewer/experimental.hh>
+#include <imgui/imgui.h>
 #include <fstream>
 
 namespace SurfaceMaps
@@ -92,6 +95,70 @@ void validate_jacobian_field(
     ISM_ASSERT_L(max_error, 1e-8);
 }
 
+/// Compute the actual and prescribed Jacobians of a single T-face.
+/// Returns false if the face is degenerate on either surface or J* is near-singular.
+bool compute_T_face_jacobians(
+        const MapState& map_state,
+        const FH fh,
+        Eigen::Matrix2d& J_actual,
+        Eigen::Matrix2d& J_star)
+{
+    ISM_ASSERT_EQ(map_state.pairs_map_distortion.size(), 1);
+    const int mesh_A_idx = map_state.pairs_map_distortion[0].first;
+    const int mesh_B_idx = map_state.pairs_map_distortion[0].second;
+
+    // Get T-triangle vertices on sphere
+    VH vh_a, vh_b, vh_c;
+    handles(map_state.mesh_T, fh, vh_a, vh_b, vh_c);
+
+    Vec3d a_sphere = map_state.embeddings_T[0][vh_a];
+    Vec3d b_sphere = map_state.embeddings_T[0][vh_b];
+    Vec3d c_sphere = map_state.embeddings_T[0][vh_c];
+
+    // Lift to surfaces
+    Vec3d a_lifted_A = lift_vertex_to_surface(a_sphere, map_state.meshes_input[mesh_A_idx],
+        map_state.meshes_embeddings_input[mesh_A_idx], map_state.bsp_embeddings_input[mesh_A_idx]);
+    Vec3d b_lifted_A = lift_vertex_to_surface(b_sphere, map_state.meshes_input[mesh_A_idx],
+        map_state.meshes_embeddings_input[mesh_A_idx], map_state.bsp_embeddings_input[mesh_A_idx]);
+    Vec3d c_lifted_A = lift_vertex_to_surface(c_sphere, map_state.meshes_input[mesh_A_idx],
+        map_state.meshes_embeddings_input[mesh_A_idx], map_state.bsp_embeddings_input[mesh_A_idx]);
+
+    Vec3d a_lifted_B = lift_vertex_to_surface(a_sphere, map_state.meshes_input[mesh_B_idx],
+        map_state.meshes_embeddings_input[mesh_B_idx], map_state.bsp_embeddings_input[mesh_B_idx]);
+    Vec3d b_lifted_B = lift_vertex_to_surface(b_sphere, map_state.meshes_input[mesh_B_idx],
+        map_state.meshes_embeddings_input[mesh_B_idx], map_state.bsp_embeddings_input[mesh_B_idx]);
+    Vec3d c_lifted_B = lift_vertex_to_surface(c_sphere, map_state.meshes_input[mesh_B_idx],
+        map_state.meshes_embeddings_input[mesh_B_idx], map_state.bsp_embeddings_input[mesh_B_idx]);
+
+    // Compute actual Jacobian
+    Eigen::Vector2d a_local_A, b_local_A, c_local_A;
+    Eigen::Vector2d a_local_B, b_local_B, c_local_B;
+    to_local_coordinates(a_lifted_A, b_lifted_A, c_lifted_A, a_local_A, b_local_A, c_local_A);
+    to_local_coordinates(a_lifted_B, b_lifted_B, c_lifted_B, a_local_B, b_local_B, c_local_B);
+
+    Eigen::Matrix2d M_A;
+    M_A << b_local_A - a_local_A, c_local_A - a_local_A;
+    Eigen::Matrix2d M_B;
+    M_B << b_local_B - a_local_B, c_local_B - a_local_B;
+
+    if (M_A.determinant() <= 0 || M_B.determinant() <= 0)
+        return false;
+
+    J_actual = M_B * M_A.inverse();
+
+    // Look up prescribed Jacobian
+    J_star = lookup_prescribed_jacobian(
+        a_sphere, b_sphere, c_sphere,
+        a_lifted_A, b_lifted_A, c_lifted_A,
+        a_lifted_B, b_lifted_B, c_lifted_B,
+        0, map_state);
+
+    if (std::abs(J_star.determinant()) <= 1e-10)
+        return false;
+
+    return true;
+}
+
 /// Compute the rotation-invariant residual of the map against the prescribed field:
 /// the singular values of J * J*^{-1} per T-face, which are all 1 exactly when the
 /// pullback metric matches the prescription. (A Frobenius norm ||J - J*|| is misleading
@@ -113,61 +180,11 @@ void compute_metric_residual(
     if (deviation_per_face)
         *deviation_per_face = ExternalProperty<FH, double>(map_state.mesh_T, 0.0);
 
-    // Get the mesh pair
-    ISM_ASSERT_EQ(map_state.pairs_map_distortion.size(), 1);
-    const int mesh_A_idx = map_state.pairs_map_distortion[0].first;
-    const int mesh_B_idx = map_state.pairs_map_distortion[0].second;
-
     // For each face of T
     for (auto fh : map_state.mesh_T.faces())
     {
-        // Get T-triangle vertices on sphere
-        VH vh_a, vh_b, vh_c;
-        handles(map_state.mesh_T, fh, vh_a, vh_b, vh_c);
-
-        Vec3d a_sphere = map_state.embeddings_T[0][vh_a];
-        Vec3d b_sphere = map_state.embeddings_T[0][vh_b];
-        Vec3d c_sphere = map_state.embeddings_T[0][vh_c];
-
-        // Lift to surfaces
-        Vec3d a_lifted_A = lift_vertex_to_surface(a_sphere, map_state.meshes_input[mesh_A_idx],
-            map_state.meshes_embeddings_input[mesh_A_idx], map_state.bsp_embeddings_input[mesh_A_idx]);
-        Vec3d b_lifted_A = lift_vertex_to_surface(b_sphere, map_state.meshes_input[mesh_A_idx],
-            map_state.meshes_embeddings_input[mesh_A_idx], map_state.bsp_embeddings_input[mesh_A_idx]);
-        Vec3d c_lifted_A = lift_vertex_to_surface(c_sphere, map_state.meshes_input[mesh_A_idx],
-            map_state.meshes_embeddings_input[mesh_A_idx], map_state.bsp_embeddings_input[mesh_A_idx]);
-
-        Vec3d a_lifted_B = lift_vertex_to_surface(a_sphere, map_state.meshes_input[mesh_B_idx],
-            map_state.meshes_embeddings_input[mesh_B_idx], map_state.bsp_embeddings_input[mesh_B_idx]);
-        Vec3d b_lifted_B = lift_vertex_to_surface(b_sphere, map_state.meshes_input[mesh_B_idx],
-            map_state.meshes_embeddings_input[mesh_B_idx], map_state.bsp_embeddings_input[mesh_B_idx]);
-        Vec3d c_lifted_B = lift_vertex_to_surface(c_sphere, map_state.meshes_input[mesh_B_idx],
-            map_state.meshes_embeddings_input[mesh_B_idx], map_state.bsp_embeddings_input[mesh_B_idx]);
-
-        // Compute actual Jacobian
-        Eigen::Vector2d a_local_A, b_local_A, c_local_A;
-        Eigen::Vector2d a_local_B, b_local_B, c_local_B;
-        to_local_coordinates(a_lifted_A, b_lifted_A, c_lifted_A, a_local_A, b_local_A, c_local_A);
-        to_local_coordinates(a_lifted_B, b_lifted_B, c_lifted_B, a_local_B, b_local_B, c_local_B);
-
-        Eigen::Matrix2d M_A;
-        M_A << b_local_A - a_local_A, c_local_A - a_local_A;
-        Eigen::Matrix2d M_B;
-        M_B << b_local_B - a_local_B, c_local_B - a_local_B;
-
-        if (M_A.determinant() <= 0 || M_B.determinant() <= 0)
-            continue;
-
-        Eigen::Matrix2d J_actual = M_B * M_A.inverse();
-
-        // Look up prescribed Jacobian
-        Eigen::Matrix2d J_star = lookup_prescribed_jacobian(
-            a_sphere, b_sphere, c_sphere,
-            a_lifted_A, b_lifted_A, c_lifted_A,
-            a_lifted_B, b_lifted_B, c_lifted_B,
-            0, map_state);
-
-        if (std::abs(J_star.determinant()) <= 1e-10)
+        Eigen::Matrix2d J_actual, J_star;
+        if (!compute_T_face_jacobians(map_state, fh, J_actual, J_star))
             continue;
 
         // Singular values of the residual J * J*^{-1}: both 1 iff the metric matches
@@ -189,6 +206,69 @@ void compute_metric_residual(
         mean_deviation /= 2.0 * count;
         frac_over_thresh /= count;
     }
+}
+
+/// Pick the face of a mesh closest to the mouse cursor's world position.
+/// Follows the pattern of pick_vertex in Viewer/Picking.cc.
+/// Returns an invalid handle (and infinite distance) if the mouse is not over geometry.
+FH pick_face(
+        const TriMesh& _mesh,
+        double& _dist_sqr)
+{
+    using namespace gv::experimental;
+    _dist_sqr = INF_DOUBLE;
+
+    // Don't pick if UI captures the mouse click
+    if (ImGui::GetIO().WantCaptureMouse)
+        return FH(-1);
+
+    // Get mouse position
+    auto p_world = interactive_get_position(interactive_get_mouse_position());
+
+    if (!p_world.has_value() || _mesh.n_faces() == 0)
+        return FH(-1);
+
+    const tg::pos3 p = p_world.value();
+
+    // Return face with the closest point-to-triangle distance
+    FH fh_best(-1);
+    for (auto fh : _mesh.faces())
+    {
+        VH vh_a, vh_b, vh_c;
+        handles(_mesh, fh, vh_a, vh_b, vh_c);
+        const tg::triangle3 tri(tg::pos3(_mesh.point(vh_a)), tg::pos3(_mesh.point(vh_b)), tg::pos3(_mesh.point(vh_c)));
+        const double d = tg::distance_sqr(p, tg::project(p, tri));
+        if (d < _dist_sqr)
+        {
+            _dist_sqr = d;
+            fh_best = fh;
+        }
+    }
+    return fh_best;
+}
+
+/// Draw a face highlight slightly offset along the face normal (avoids z-fighting).
+void highlight_face(
+        const TriMesh& _mesh,
+        const int _face_idx,
+        gv::canvas_t& _c)
+{
+    if (_face_idx < 0 || _face_idx >= (int)_mesh.n_faces())
+        return;
+
+    VH vh_a, vh_b, vh_c;
+    handles(_mesh, FH(_face_idx), vh_a, vh_b, vh_c);
+
+    const Vec3d a = _mesh.point(vh_a);
+    const Vec3d b = _mesh.point(vh_b);
+    const Vec3d c = _mesh.point(vh_c);
+    const Vec3d offset = 1e-3 * ((b - a).cross(c - a)).normalized();
+
+    _c.add_face(tg::pos3(a + offset), tg::pos3(b + offset), tg::pos3(c + offset), tg::color3(YELLOW));
+    _c.set_line_width_world(0.002);
+    _c.add_line(tg::pos3(a + offset), tg::pos3(b + offset), tg::color3(YELLOW));
+    _c.add_line(tg::pos3(b + offset), tg::pos3(c + offset), tg::color3(YELLOW));
+    _c.add_line(tg::pos3(c + offset), tg::pos3(a + offset), tg::color3(YELLOW));
 }
 
 void run()
@@ -360,36 +440,90 @@ void run()
         write_mesh(lifted_Ts[i], output_dir / ("T_lifted_" + std::to_string(i) + ".obj"));
 
     // Visualization
+    // Both lifted meshes share mesh_T's connectivity, so a face selected on one pane
+    // is the corresponding face on the other. Middle-click a triangle to inspect it.
     ISM_INFO("Generating visualization...");
+    ISM_INFO("Middle-click or double-click a triangle (in any pane) to highlight it on both meshes and show its singular values.");
     {
         auto style = default_style();
-        auto g = gv::grid();
 
-        // Left: Mesh A with lifted T overlay
-        {
-            auto v = gv::view();
-            view_mesh(map_state.meshes_input[0], Color(0.8, 0.8, 0.8, 0.5));
-            view_mesh(lifted_Ts[0], Color(1.0, 1.0, 1.0, 0.8));
-            view_wireframe(lifted_Ts[0], MAGENTA, WidthScreen(0.5));
-        }
+        int selected_face = -1;
 
-        // Right: Mesh B with lifted T overlay
+        gv::interactive([&] (auto)
         {
-            auto v = gv::view();
-            view_mesh(map_state.meshes_input[1], Color(0.8, 0.8, 0.8, 0.5));
-            view_mesh(lifted_Ts[1], Color(1.0, 1.0, 1.0, 0.8));
-            view_wireframe(lifted_Ts[1], TEAL, WidthScreen(0.5));
-        }
+            // Middle-click or double-click: select the T-face under the mouse. The picked
+            // world position lies on whichever lifted mesh is hovered, so take the closer
+            // of the two.
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Middle) || ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+            {
+                double dist_0, dist_1;
+                const FH fh_0 = pick_face(lifted_Ts[0], dist_0);
+                const FH fh_1 = pick_face(lifted_Ts[1], dist_1);
+                const FH fh_pick = (dist_0 <= dist_1) ? fh_0 : fh_1;
+                if (fh_pick.is_valid())
+                    selected_face = fh_pick.idx();
+            }
 
-        // Third: metric residual heatmap on B.
-        // White = pullback metric matches the prescription; magenta = deviation >= 0.5.
-        // Color off the stretched arm means real smearing; color only along the
-        // transition band means T-triangles straddling the prescription jump.
-        {
-            auto v = gv::view();
-            auto colors = linear_colors(deviation_per_face, 0.0, 0.5, WHITE, MAGENTA);
-            gv::view(make_renderable(lifted_Ts[1], colors));
-        }
+            // Info window for the selected triangle
+            if (selected_face >= 0)
+            {
+                const FH fh(selected_face);
+                ImGui::Begin("Selected triangle");
+                ImGui::Text("T-face %d", selected_face);
+
+                Eigen::Matrix2d J_actual, J_star;
+                if (compute_T_face_jacobians(map_state, fh, J_actual, J_star))
+                {
+                    const Eigen::Vector2d s_actual = Eigen::JacobiSVD<Eigen::Matrix2d>(J_actual).singularValues();
+                    const Eigen::Vector2d s_target = Eigen::JacobiSVD<Eigen::Matrix2d>(J_star).singularValues();
+                    const Eigen::Vector2d s_residual = Eigen::JacobiSVD<Eigen::Matrix2d>(J_actual * J_star.inverse()).singularValues();
+
+                    ImGui::Text("sigma(J) actual:      %.4f  %.4f", s_actual[0], s_actual[1]);
+                    ImGui::Text("sigma(J*) prescribed: %.4f  %.4f", s_target[0], s_target[1]);
+                    ImGui::Separator();
+                    ImGui::Text("sigma(J J*^-1):       %.4f  %.4f", s_residual[0], s_residual[1]);
+                    ImGui::Text("deviation from 1:     %.4f",
+                                std::max(std::abs(s_residual[0] - 1.0), std::abs(s_residual[1] - 1.0)));
+                }
+                else
+                {
+                    ImGui::Text("Degenerate triangle or prescription.");
+                }
+                ImGui::End();
+            }
+
+            auto g = gv::grid();
+
+            // Left: Mesh A with lifted T overlay
+            {
+                auto v = gv::view();
+                auto c = gv::canvas();
+                highlight_face(lifted_Ts[0], selected_face, c);
+                view_mesh(map_state.meshes_input[0], Color(0.8, 0.8, 0.8, 0.5));
+                view_mesh(lifted_Ts[0], Color(1.0, 1.0, 1.0, 0.8));
+                view_wireframe(lifted_Ts[0], MAGENTA, WidthScreen(0.5));
+            }
+
+            // Right: Mesh B with lifted T overlay
+            {
+                auto v = gv::view();
+                auto c = gv::canvas();
+                highlight_face(lifted_Ts[1], selected_face, c);
+                view_mesh(map_state.meshes_input[1], Color(0.8, 0.8, 0.8, 0.5));
+                view_mesh(lifted_Ts[1], Color(1.0, 1.0, 1.0, 0.8));
+                view_wireframe(lifted_Ts[1], TEAL, WidthScreen(0.5));
+            }
+
+            // Third: metric residual heatmap on B.
+            // White = pullback metric matches the prescription; magenta = deviation >= 0.5.
+            // Color off the stretched arm means real smearing; color only along the
+            // transition band means T-triangles straddling the prescription jump.
+            {
+                auto v = gv::view();
+                auto colors = linear_colors(deviation_per_face, 0.0, 0.5, WHITE, MAGENTA);
+                gv::view(make_renderable(lifted_Ts[1], colors));
+            }
+        });
     }
 
     ISM_INFO("Total run time: " << timer_landmark.seconds() + timer_coarse_init.seconds() + timer_coarse.seconds() + timer_fine.seconds() << " seconds");
