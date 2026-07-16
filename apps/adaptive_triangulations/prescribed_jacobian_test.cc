@@ -31,16 +31,87 @@
 namespace SurfaceMaps
 {
 
-/// Compute the residual Jacobian error for verification
-/// Returns the mean and max Frobenius norm of ||J - J*||
-void compute_jacobian_residual(
-        const MapState& map_state,
-        double& mean_residual,
-        double& max_residual)
+/// Validate the extracted Jacobian field with zero optimization involved:
+/// reconstructing B's triangles from A's via J* must succeed to machine precision,
+/// since both meshes share connectivity and J* is exact per face.
+void validate_jacobian_field(
+        const TriMesh& mesh_A,
+        const TriMesh& mesh_B,
+        const ExternalProperty<FH, PrescribedJacobian>& field)
 {
-    mean_residual = 0.0;
-    max_residual = 0.0;
+    double max_error = 0.0;
+
+    for (auto fh : mesh_A.faces())
+    {
+        VH vh_a, vh_b, vh_c;
+        handles(mesh_A, fh, vh_a, vh_b, vh_c);
+
+        Vec3d a_A = mesh_A.point(vh_a);
+        Vec3d b_A = mesh_A.point(vh_b);
+        Vec3d c_A = mesh_A.point(vh_c);
+        Vec3d a_B = mesh_B.point(vh_a);
+        Vec3d b_B = mesh_B.point(vh_b);
+        Vec3d c_B = mesh_B.point(vh_c);
+
+        // Local frames and edge matrices, exactly as in extract_jacobian_field
+        Eigen::Vector2d a_local_A, b_local_A, c_local_A;
+        Eigen::Vector2d a_local_B, b_local_B, c_local_B;
+        to_local_coordinates(a_A, b_A, c_A, a_local_A, b_local_A, c_local_A);
+        to_local_coordinates(a_B, b_B, c_B, a_local_B, b_local_B, c_local_B);
+
+        Eigen::Matrix2d M_A;
+        M_A << b_local_A - a_local_A, c_local_A - a_local_A;
+        Eigen::Matrix2d M_B;
+        M_B << b_local_B - a_local_B, c_local_B - a_local_B;
+
+        // Project the stored 3D singular vectors back into the face frames
+        Vec3d normal_A = ((b_A - a_A).cross(c_A - a_A)).normalized();
+        Vec3d basis0_A = (b_A - a_A).normalized();
+        Vec3d basis1_A = normal_A.cross(basis0_A);
+
+        Vec3d normal_B = ((b_B - a_B).cross(c_B - a_B)).normalized();
+        Vec3d basis0_B = (b_B - a_B).normalized();
+        Vec3d basis1_B = normal_B.cross(basis0_B);
+
+        const PrescribedJacobian& pj = field[fh];
+        Eigen::Matrix2d V_2d, U_2d;
+        for (int i = 0; i < 2; ++i)
+        {
+            V_2d(0, i) = basis0_A.dot(pj.V.col(i));
+            V_2d(1, i) = basis1_A.dot(pj.V.col(i));
+            U_2d(0, i) = basis0_B.dot(pj.U.col(i));
+            U_2d(1, i) = basis1_B.dot(pj.U.col(i));
+        }
+
+        // Reconstruct J* and check that it maps A's edges onto B's edges
+        Eigen::Matrix2d J_star = U_2d * pj.sigma.asDiagonal() * V_2d.transpose();
+        max_error = std::max(max_error, (J_star * M_A - M_B).norm());
+    }
+
+    ISM_INFO("Jacobian field validation: max reconstruction error = " << max_error);
+    ISM_ASSERT_L(max_error, 1e-8);
+}
+
+/// Compute the rotation-invariant residual of the map against the prescribed field:
+/// the singular values of J * J*^{-1} per T-face, which are all 1 exactly when the
+/// pullback metric matches the prescription. (A Frobenius norm ||J - J*|| is misleading
+/// here: the energy is invariant under J -> R*J*, so it can stay large at a perfect
+/// metric match.) Reports mean/max |sigma - 1| and the fraction of faces over 0.1,
+/// and optionally the per-face max deviation for heatmap visualization.
+void compute_metric_residual(
+        const MapState& map_state,
+        double& mean_deviation,
+        double& max_deviation,
+        double& frac_over_thresh,
+        ExternalProperty<FH, double>* deviation_per_face = nullptr)
+{
+    mean_deviation = 0.0;
+    max_deviation = 0.0;
+    frac_over_thresh = 0.0;
     int count = 0;
+
+    if (deviation_per_face)
+        *deviation_per_face = ExternalProperty<FH, double>(map_state.mesh_T, 0.0);
 
     // Get the mesh pair
     ISM_ASSERT_EQ(map_state.pairs_map_distortion.size(), 1);
@@ -96,19 +167,42 @@ void compute_jacobian_residual(
             a_lifted_B, b_lifted_B, c_lifted_B,
             0, map_state);
 
-        // Compute residual
-        double residual = (J_actual - J_star).norm();
-        mean_residual += residual;
-        max_residual = std::max(max_residual, residual);
+        if (std::abs(J_star.determinant()) <= 1e-10)
+            continue;
+
+        // Singular values of the residual J * J*^{-1}: both 1 iff the metric matches
+        Eigen::JacobiSVD<Eigen::Matrix2d> svd(J_actual * J_star.inverse());
+        const double dev = std::max(std::abs(svd.singularValues()[0] - 1.0),
+                                    std::abs(svd.singularValues()[1] - 1.0));
+
+        mean_deviation += std::abs(svd.singularValues()[0] - 1.0) + std::abs(svd.singularValues()[1] - 1.0);
+        max_deviation = std::max(max_deviation, dev);
+        if (dev > 0.1)
+            frac_over_thresh += 1.0;
+        if (deviation_per_face)
+            (*deviation_per_face)[fh] = dev;
         count++;
     }
 
     if (count > 0)
-        mean_residual /= count;
+    {
+        mean_deviation /= 2.0 * count;
+        frac_over_thresh /= count;
+    }
 }
 
 void run()
 {
+    // Tunable weights for the prescribed phases.
+    // w_mesh trades triangle quality against the prescription: high values fight the
+    // prescribed anisotropy (E_mesh wants equilateral triangles on both surfaces),
+    // but 0 lets triangles drift freely wherever the prescription is isotropic
+    // (in-plane sliding/rotation on flat regions costs no map energy).
+    const double w_mesh_stage1 = 0.25;
+    const double w_mesh_stage2 = 0.1;
+    const int max_iterations_stage1 = 100;
+    const int max_iterations_stage2 = 50;
+
     // Prepare output dir
     fs::path output_dir = OUTPUT_PATH / "prescribed_jacobian_test";
     fs::path screenshot_dir = output_dir / "screenshots";
@@ -194,6 +288,10 @@ void run()
         extract_jacobian_field(map_state.meshes_input[0], map_state.meshes_input[1]);
     map_state.prescribed_jacobians.push_back(jacobian_field_state);
 
+    // Sanity-check the field before any optimization: reconstructing B from A + J*
+    // must succeed to machine precision.
+    validate_jacobian_field(map_state.meshes_input[0], map_state.meshes_input[1], jacobian_field_state);
+
     // Assign vertices to faces
     assign_vertices_to_T_faces(map_state);
 
@@ -210,17 +308,22 @@ void run()
     coarse_phase(map_state);
     timer_coarse_init.stop();
 
+    // Baseline residual: the standard energy targets isometry, not the prescription,
+    // so this should be clearly nonzero.
+    double mean_dev, max_dev, frac_bad;
+    compute_metric_residual(map_state, mean_dev, max_dev, frac_bad);
+    ISM_INFO("Metric residual |sigma(J J*^-1) - 1| after coarse phase (baseline): "
+             << "mean=" << mean_dev << ", max=" << max_dev << ", frac>0.1: " << frac_bad);
+
     // Stage 1: continuous phase only, no remeshing.
-    // mesh_T is initialized as a copy of mesh A, so T's triangles coincide with A's
-    // and the prescribed field lookup is trivial.
     ISM_INFO("Running prescribed Jacobian phase (metric form, remeshing disabled)...");
     AdaptiveTriangulationsSettings settings = fine_phase_settings();
     settings.use_prescribed_jacobian = true;
     settings.allow_splits = false;
     settings.allow_collapses = false;
     settings.allow_flips = false;
-    settings.w_mesh = 0.0; // No remeshing, so no need for the equilateral quality term
-    settings.max_iterations = 100;
+    settings.w_mesh = w_mesh_stage1;
+    settings.max_iterations = max_iterations_stage1;
     settings.w_approx = 1.0;
     settings.w_map = 1.0;
 
@@ -228,26 +331,27 @@ void run()
     optimize_with_remeshing(map_state, settings);
     timer_coarse.stop();
 
-    // Compute and print residual
-    double mean_residual, max_residual;
-    compute_jacobian_residual(map_state, mean_residual, max_residual);
-    ISM_INFO("Jacobian residual after continuous phase: mean=" << mean_residual << ", max=" << max_residual);
+    compute_metric_residual(map_state, mean_dev, max_dev, frac_bad);
+    ISM_INFO("Metric residual |sigma(J J*^-1) - 1| after continuous phase: "
+             << "mean=" << mean_dev << ", max=" << max_dev << ", frac>0.1: " << frac_bad);
 
     // Stage 2: enable remeshing with a lowered mesh weight, since the equilateral
     // target of E_mesh fights the prescribed anisotropy.
     ISM_INFO("Running fine phase with prescribed Jacobian energy (remeshing enabled)...");
     settings = fine_phase_settings(0.0005);  // tighter approx error
     settings.use_prescribed_jacobian = true;
-    settings.w_mesh = 0.1;
-    settings.max_iterations = 50;
+    settings.w_mesh = w_mesh_stage2;
+    settings.max_iterations = max_iterations_stage2;
 
     TinyAD::Timer timer_fine("Fine phase (prescribed Jacobian)");
     optimize_with_remeshing(map_state, settings);
     timer_fine.stop();
 
-    // Compute final residual
-    compute_jacobian_residual(map_state, mean_residual, max_residual);
-    ISM_INFO("Jacobian residual after fine phase: mean=" << mean_residual << ", max=" << max_residual);
+    // Final residual, keeping the per-face deviation for the heatmap
+    ExternalProperty<FH, double> deviation_per_face;
+    compute_metric_residual(map_state, mean_dev, max_dev, frac_bad, &deviation_per_face);
+    ISM_INFO("Metric residual |sigma(J J*^-1) - 1| after fine phase: "
+             << "mean=" << mean_dev << ", max=" << max_dev << ", frac>0.1: " << frac_bad);
 
     // Write output meshes
     ISM_INFO("Writing output meshes...");
@@ -274,7 +378,17 @@ void run()
             auto v = gv::view();
             view_mesh(map_state.meshes_input[1], Color(0.8, 0.8, 0.8, 0.5));
             view_mesh(lifted_Ts[1], Color(1.0, 1.0, 1.0, 0.8));
-            view_wireframe(lifted_Ts[1], CYAN, WidthScreen(0.5));
+            view_wireframe(lifted_Ts[1], TEAL, WidthScreen(0.5));
+        }
+
+        // Third: metric residual heatmap on B.
+        // White = pullback metric matches the prescription; magenta = deviation >= 0.5.
+        // Color off the stretched arm means real smearing; color only along the
+        // transition band means T-triangles straddling the prescription jump.
+        {
+            auto v = gv::view();
+            auto colors = linear_colors(deviation_per_face, 0.0, 0.5, WHITE, MAGENTA);
+            gv::view(make_renderable(lifted_Ts[1], colors));
         }
     }
 
