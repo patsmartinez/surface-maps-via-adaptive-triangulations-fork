@@ -83,6 +83,24 @@ const bool PRESCRIBED_IN_COARSE_PHASE = false;
 /// by coarse-scale representation error -- read corr_mean, not residual.
 const bool DISABLE_REMESHING = false;
 
+/// Per-iteration trace. The optimizer already exposes two callbacks and we just pass
+/// lambdas into them -- nothing in the algorithm changes.
+///   _callback_for_optim  fires once per Newton iteration, inside the loop, after
+///                        embeddings_T and the local bases have been updated
+///                        (OptimizeMap.cc: "after_optimization").
+///   _callback_for_remesh fires three times per remeshing pass
+///                        (Remeshing.cc: "after_splits" / "after_collapses" / "after_flips").
+/// Because they are separate, a jump in the metrics can be attributed to a continuous
+/// Newton step or to one specific remeshing operation -- which no end-of-phase number
+/// can tell you. Writes <config>/trace.csv, one row per step.
+const bool TRACE_ITERATIONS = true;
+/// Also dump lifted meshes per traced step, for an animation. Off-by-default would make
+/// the trace CSV-only; the meshes are what you actually watch.
+const bool TRACE_WRITE_MESHES = true;
+/// Dump a mesh only every Nth traced step (the CSV always gets every step).
+/// Raise this if the frame count gets unwieldy; the coarse phase is the interesting part.
+const int TRACE_MESH_STRIDE = 1;
+
 /// Checkerboard transfer settings.
 /// Texcoords are built as (point[(dir+1)%3], point[(dir+2)%3]), so dir = 2 gives
 /// (x, y) -- the right choice for the L, which lies in the xy-plane and is extruded
@@ -172,18 +190,54 @@ void compute_correspondence_error(
 }
 
 /// Distribution of the per-face residual.
-/// The mean alone cannot tell a heavy tail (a few badly-mismatched faces, e.g. in the
-/// transition band of the stretched L) from a uniformly wrong map -- and the two call
-/// for opposite fixes. Median and the tail fraction separate them.
+///
+/// Two things the plain mean cannot do:
+///
+/// (1) COMPARE ACROSS STAGES. The unweighted average over T faces changes meaning when
+///     refinement takes T from ~50 faces to ~630, because refinement concentrates small
+///     faces wherever it chooses to refine. The *_aw fields weight each face by the area
+///     of the mesh-A material it covers, which is stage-independent; compare those.
+///     The unweighted fields are kept unchanged so older CSVs remain comparable, and the
+///     gap between `mean` and `mean_aw` is itself a readout of how much the unweighted
+///     statistic is being distorted.
+///
+/// (2) SAY WHAT KIND OF WRONG. The residual J*J*^-1 has singular values s0, s1, and
+///     log-splits into two independent parts:
+///         area  = |log(s0*s1)|  -- material is in the wrong PLACE (mis-allocated area)
+///         shape = |log(s0/s1)|  -- material is the wrong SHAPE   (sheared / anisotropy off)
+///     Both vanish exactly at s0 = s1 = 1. Area-dominant points at coarse-scale
+///     representativeness (the centroid lookup smearing the prescription); shape-dominant
+///     points at local shear, i.e. sliding and initialization.
 struct ResidualStats
 {
-    double mean = 0.0;         ///< unchanged from before: comparable across earlier runs
+    double mean = 0.0;            ///< unweighted; unchanged, comparable with earlier runs
+    double mean_aw = 0.0;         ///< area-weighted -- the one to compare ACROSS stages
     double median = 0.0;
+    double median_aw = 0.0;
     double p90 = 0.0;
-    double max = 0.0;          ///< per-face max over the two singular values, then max over faces
-    double frac_gt_0p1 = 0.0;  ///< fraction of faces off by more than 10%
-    int n_faces = 0;           ///< faces actually measured; degenerate ones are skipped
+    double max = 0.0;             ///< per-face max over the two singular values, then max over faces
+    double frac_gt_0p1 = 0.0;     ///< fraction of faces off by more than 10%
+    double frac_gt_0p1_aw = 0.0;  ///< fraction of AREA off by more than 10%
+    double area_part_aw = 0.0;    ///< area-weighted mean |log(s0*s1)|
+    double shape_part_aw = 0.0;   ///< area-weighted mean |log(s0/s1)|
+    int n_faces = 0;              ///< faces actually measured; degenerate ones are skipped
 };
+
+/// Percentile of (value, weight) pairs, sorted ascending by value.
+double weighted_percentile(
+        const std::vector<std::pair<double, double>>& _sorted,
+        const double _total_weight,
+        const double _q)
+{
+    double acc = 0.0;
+    for (const auto& vw : _sorted)
+    {
+        acc += vw.second;
+        if (acc >= _q * _total_weight)
+            return vw.first;
+    }
+    return _sorted.back().first;
+}
 
 /// Rotation-invariant residual against the prescribed field: singular values of
 /// J * J*^{-1}, which are all 1 exactly when the pullback metric matches the
@@ -195,9 +249,11 @@ void compute_metric_residual(
 {
     _stats = ResidualStats();
 
-    // Per-face deviation, kept so we can take percentiles at the end.
-    std::vector<double> devs;
+    // (deviation, area of the lifted A triangle), kept so we can take percentiles
+    // and area-weighted means at the end.
+    std::vector<std::pair<double, double>> devs;
     devs.reserve(_map_state.mesh_T.n_faces());
+    double total_area = 0.0;
 
     const int mesh_A_idx = _map_state.pairs_map_distortion[0].first;
     const int mesh_B_idx = _map_state.pairs_map_distortion[0].second;
@@ -254,26 +310,54 @@ void compute_metric_residual(
                 J_actual * V_local * Eigen::Vector2d(1.0 / sigma[0], 1.0 / sigma[1]).asDiagonal();
         const Eigen::Vector2d s = Eigen::JacobiSVD<Eigen::Matrix2d>(residual).singularValues();
 
-        devs.push_back((std::abs(s[0] - 1.0) + std::abs(s[1] - 1.0)) / 2.0);
-        _stats.max = std::max(_stats.max, std::max(std::abs(s[0] - 1.0), std::abs(s[1] - 1.0)));
+        // Both determinants are > 0 and sigma is bounded away from 0 (checked above), so
+        // the residual is nonsingular; the clamp only guards against roundoff in the log.
+        const double s0 = s[0];
+        const double s1 = std::max(s[1], 1e-12);
+
+        // det(M_A) = 2 * area of the lifted A triangle, i.e. the amount of mesh-A
+        // material this T face is responsible for.
+        const double area_A = 0.5 * M_A.determinant();
+
+        devs.emplace_back((std::abs(s0 - 1.0) + std::abs(s1 - 1.0)) / 2.0, area_A);
+        total_area += area_A;
+
+        _stats.max = std::max(_stats.max, std::max(std::abs(s0 - 1.0), std::abs(s1 - 1.0)));
+        _stats.area_part_aw  += area_A * std::abs(std::log(s0 * s1));
+        _stats.shape_part_aw += area_A * std::abs(std::log(s0 / s1));
     }
 
     if (devs.empty())
         return;
 
-    for (const double d : devs)
-    {
-        _stats.mean += d;
-        if (d > 0.1)
-            _stats.frac_gt_0p1 += 1.0;
-    }
-    _stats.mean /= (double)devs.size();
-    _stats.frac_gt_0p1 /= (double)devs.size();
+    const int n = (int)devs.size();
+    _stats.n_faces = n;
 
-    std::sort(devs.begin(), devs.end());
-    _stats.median = devs[devs.size() / 2];
-    _stats.p90 = devs[std::min(devs.size() - 1, (size_t)(0.9 * devs.size()))];
-    _stats.n_faces = (int)devs.size();
+    for (const auto& vw : devs)
+    {
+        _stats.mean += vw.first;
+        _stats.mean_aw += vw.second * vw.first;
+        if (vw.first > 0.1)
+        {
+            _stats.frac_gt_0p1 += 1.0;
+            _stats.frac_gt_0p1_aw += vw.second;
+        }
+    }
+    _stats.mean /= (double)n;
+    _stats.frac_gt_0p1 /= (double)n;
+
+    if (total_area > 0.0)
+    {
+        _stats.mean_aw /= total_area;
+        _stats.frac_gt_0p1_aw /= total_area;
+        _stats.area_part_aw /= total_area;
+        _stats.shape_part_aw /= total_area;
+    }
+
+    std::sort(devs.begin(), devs.end()); // by deviation
+    _stats.median = devs[n / 2].first;
+    _stats.p90 = devs[std::min(n - 1, (int)(0.9 * n))].first;
+    _stats.median_aw = weighted_percentile(devs, total_area, 0.5);
 }
 
 /// Report both metrics at a pipeline checkpoint, and append a row to the CSV.
@@ -292,17 +376,66 @@ void report(
 
     ISM_INFO("[" << _config_name << " | " << _stage << "] "
              << "corr_err mean=" << corr_mean << " median=" << corr_median << " max=" << corr_max
-             << " | residual mean=" << res.mean << " median=" << res.median
-             << " p90=" << res.p90 << " max=" << res.max
-             << " frac>0.1=" << res.frac_gt_0p1 << " (" << res.n_faces << " faces)"
+             << " | residual mean=" << res.mean << " (aw " << res.mean_aw << ")"
+             << " median=" << res.median << " p90=" << res.p90 << " max=" << res.max
+             << " frac>0.1=" << res.frac_gt_0p1
+             << " | area=" << res.area_part_aw << " shape=" << res.shape_part_aw
+             << " (" << res.n_faces << " faces)"
              << " | |V(T)|=" << _map_state.mesh_T.n_vertices());
 
     _csv << _config_name << "," << _stage << ","
          << corr_mean << "," << corr_median << "," << corr_max << ","
-         << res.mean << "," << res.median << "," << res.p90 << "," << res.max << ","
-         << res.frac_gt_0p1 << "," << res.n_faces << ","
+         << res.mean << "," << res.mean_aw << ","
+         << res.median << "," << res.median_aw << "," << res.p90 << "," << res.max << ","
+         << res.frac_gt_0p1 << "," << res.frac_gt_0p1_aw << ","
+         << res.area_part_aw << "," << res.shape_part_aw << ","
+         << res.n_faces << "," << _map_state.mesh_T.n_vertices() << "\n";
+    _csv.flush();
+}
+
+/// Zero-padded frame index, so the dumped meshes sort in optimization order.
+std::string pad4(const int _i)
+{
+    const std::string s = std::to_string(_i);
+    return std::string(std::max(0, 4 - (int)s.size()), '0') + s;
+}
+
+/// One row of the per-iteration trace, plus (optionally) a mesh pair for the animation.
+/// Called from the optimizer's own callbacks, so the state is a completed iteration:
+/// embeddings_T are updated, the local bases are re-centered, and the vertex-to-T-face
+/// assignments were refreshed inside the line search.
+void trace_step(
+        const MapState& _map_state,
+        const fs::path& _output_dir,
+        const std::string& _kind,
+        const std::string& _label,
+        int& _frame,
+        std::ofstream& _csv)
+{
+    double corr_mean, corr_median, corr_max;
+    compute_correspondence_error(_map_state, corr_mean, corr_median, corr_max);
+
+    ResidualStats res;
+    compute_metric_residual(_map_state, res);
+
+    // Area-weighted only: T changes size constantly here, so the unweighted numbers
+    // would not be comparable from one row to the next.
+    _csv << _frame << "," << _kind << "," << _label << ","
+         << corr_mean << "," << corr_median << ","
+         << res.mean_aw << "," << res.area_part_aw << "," << res.shape_part_aw << ","
+         << res.frac_gt_0p1_aw << "," << res.n_faces << ","
          << _map_state.mesh_T.n_vertices() << "\n";
     _csv.flush();
+
+    if (TRACE_WRITE_MESHES && (_frame % std::max(1, TRACE_MESH_STRIDE) == 0))
+    {
+        const std::vector<TriMesh> lifted = lifted_meshes_from_mapstate(_map_state);
+        const fs::path dir = _output_dir / "trace";
+        write_mesh(lifted[0], dir / ("f" + pad4(_frame) + "_" + _kind + "_A.obj"));
+        write_mesh(lifted[1], dir / ("f" + pad4(_frame) + "_" + _kind + "_B.obj"));
+    }
+
+    ++_frame;
 }
 
 // ---------------------------------------------------------------------------
@@ -427,6 +560,29 @@ void run_config(
 
     report(map_state, name, "00_init", _csv);
 
+    // --- Per-iteration trace ----------------------------------------------
+    // tracer(kind) builds a callback for one call site; the optimizer supplies the
+    // label ("after_optimization", "after_splits", ...). Everything is captured by
+    // reference except the kind, which is copied into the callback.
+    std::ofstream trace_csv;
+    int trace_frame = 0;
+    if (TRACE_ITERATIONS)
+    {
+        fs::create_directories(output_dir / "trace");
+        trace_csv.open(output_dir / "trace.csv");
+        trace_csv << "frame,kind,label,corr_mean,corr_median,"
+                     "residual_mean_aw,residual_area_aw,residual_shape_aw,"
+                     "residual_frac_gt_0p1_aw,n_faces_T,n_verts_T\n";
+    }
+    auto tracer = [&] (const std::string& _kind)
+    {
+        return [&, _kind] (const std::string& _label)
+        {
+            if (TRACE_ITERATIONS)
+                trace_step(map_state, output_dir, _kind, _label, trace_frame, trace_csv);
+        };
+    };
+
     // --- Pipeline (identical across configs; only the energy differs) ------
     TinyAD::Timer timer(name);
 
@@ -444,7 +600,8 @@ void run_config(
         settings.prescribed_metric_form = true;
         if (DISABLE_REMESHING)
             settings.allow_splits = settings.allow_collapses = settings.allow_flips = false;
-        optimize_with_remeshing(map_state, settings);
+        optimize_with_remeshing(map_state, settings, "",
+                                tracer("coarse_optim"), tracer("coarse_remesh"));
     }
     report(map_state, name, "02_coarse", _csv);
 
@@ -455,7 +612,8 @@ void run_config(
         settings.max_iterations = 50;
         if (DISABLE_REMESHING)
             settings.allow_splits = settings.allow_collapses = settings.allow_flips = false;
-        optimize_with_remeshing(map_state, settings);
+        optimize_with_remeshing(map_state, settings, "",
+                                tracer("fine_optim"), tracer("fine_remesh"));
     }
     report(map_state, name, "03_final", _csv);
 
@@ -489,7 +647,9 @@ void run()
             + std::string(DISABLE_REMESHING ? "_noremesh" : "");
     std::ofstream csv(output_root / ("metrics_" + suffix + ".csv"));
     csv << "config,stage,corr_mean,corr_median,corr_max,"
-           "residual_mean,residual_median,residual_p90,residual_max,residual_frac_gt_0p1,"
+           "residual_mean,residual_mean_aw,residual_median,residual_median_aw,"
+           "residual_p90,residual_max,residual_frac_gt_0p1,residual_frac_gt_0p1_aw,"
+           "residual_area_aw,residual_shape_aw,"
            "n_faces_T,n_verts_T\n";
 
     const std::vector<Config> configs = {
