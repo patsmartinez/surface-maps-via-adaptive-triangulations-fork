@@ -6,17 +6,22 @@
  *
  * Baseline comparison for the prescribed Jacobian work.
  *
- * Runs 4 configurations over the L-shape test pair:
+ * Runs 4 configurations over the L-shape meshes:
  *
- *                   | Symmetric Dirichlet | Prescribed metric
- *   ----------------+---------------------+-------------------
- *   Shared emb.     |  "A on A" baseline  |  "A on A" ablation
- *   Independent emb.|  "A on B" baseline  |  "A on B" (the real run)
+ *                          | Symmetric Dirichlet | Prescribed metric
+ *   -----------------------+---------------------+-------------------
+ *   A on A (newL -> newL)  |  consistency check  |  consistency check
+ *   A on B (newL -> strL)  |  baseline           |  the real run
  *
- * "Shared embedding" writes mesh A's sphere embedding for BOTH meshes. Since the
- * two L meshes share connectivity, the initial map is then exactly the ground-truth
- * correspondence -- so the question becomes whether the energy HOLDS the map there.
- * This isolates energy correctness from initialization quality.
+ * "A on A" maps a mesh to ITSELF. The correct answer is the identity map, and the
+ * optimization must not deviate from it -- a pure consistency check.
+ *
+ * It is also a sharp test of the new energy: when both meshes are equal we have
+ * J* = I everywhere, so the prescribed metric energy reduces EXACTLY to symmetric
+ * Dirichlet (tr(M) + tr(M^-1) = ||J||^2 + ||J^-1||^2). The two energy columns must
+ * therefore agree on the A-on-A row; if they disagree, the prescribed path has a bug.
+ * (For J = I the SVD is degenerate and U, V are arbitrary, but M* = V*I*V^T = I
+ * regardless -- the metric form is immune to that ambiguity.)
  *
  * Ground-truth correspondence error is the primary metric: the metric residual is
  * what we minimize (a training loss), and under the gauge freedom of a metric
@@ -58,12 +63,18 @@ const bool USE_FPS_LANDMARKS = false; // false = default landmarks (first 3 vert
 const int  N_FPS_LANDMARKS   = 8;     // only used when USE_FPS_LANDMARKS is true
 const bool OPEN_VIEWER       = true;  // false = write screenshots instead
 
+/// Optional ablation, applies to the A-on-B configs only: give mesh B the SAME sphere
+/// embedding as mesh A. The two L meshes share connectivity, so the initial map is then
+/// exactly the ground-truth correspondence, and the question becomes whether the energy
+/// HOLDS the map there. Isolates energy correctness from initialization quality.
+const bool START_FROM_GROUND_TRUTH = false;
+
 // ---------------------------------------------------------------------------
 
-enum class EmbeddingMode
+enum class PairMode
 {
-    Shared,      // "A on A": mesh A's embedding used for both -> init map is ground truth
-    Independent, // "A on B": each mesh embedded on its own (the normal pipeline)
+    SelfMap,   // "A on A": newL -> newL. Correct answer is the identity map.
+    Stretched, // "A on B": newL -> stretchedL. The actual problem.
 };
 
 enum class EnergyMode
@@ -74,15 +85,15 @@ enum class EnergyMode
 
 struct Config
 {
-    EmbeddingMode embedding_mode;
+    PairMode pair_mode;
     EnergyMode energy_mode;
 
     std::string name() const
     {
-        const std::string emb = (embedding_mode == EmbeddingMode::Shared) ? "AonA" : "AonB";
+        const std::string pair = (pair_mode == PairMode::SelfMap) ? "AonA" : "AonB";
         const std::string energy = (energy_mode == EnergyMode::SymmetricDirichlet) ? "dirichlet" : "prescribed";
         const std::string lm = USE_FPS_LANDMARKS ? ("fps" + std::to_string(N_FPS_LANDMARKS)) : "default3";
-        return emb + "_" + energy + "_" + lm;
+        return pair + "_" + energy + "_" + lm;
     }
 };
 
@@ -92,7 +103,9 @@ struct Config
 
 /// Ground-truth correspondence error.
 /// The two L meshes share connectivity, so the true image of vertex v of mesh A is
-/// vertex v of mesh B. Errors are normalized by sqrt(area of B) so they are
+/// vertex v of mesh B. (In the A-on-A self-map case the two meshes are identical, so
+/// this is the identity map and the error must stay at ~0.)
+/// Errors are normalized by sqrt(area of B) so they are
 /// comparable across meshes (standard in the correspondence literature).
 /// This is the primary metric: unlike the metric residual, it is not the quantity
 /// being optimized, and it detects material "sliding" that leaves the residual at ~0.
@@ -252,8 +265,11 @@ void run_config(
     const fs::path output_dir = _output_root / name;
     fs::create_directories(output_dir);
 
+    // A on A maps the mesh to itself: both inputs are the same file.
     const fs::path mesh_path_A = DATA_PATH / "meshes/l_shape/newL.obj";
-    const fs::path mesh_path_B = DATA_PATH / "meshes/l_shape/stretchedL.obj";
+    const fs::path mesh_path_B = (_config.pair_mode == PairMode::SelfMap)
+            ? mesh_path_A
+            : DATA_PATH / "meshes/l_shape/stretchedL.obj";
 
     // --- Landmarks -------------------------------------------------------
     // Written into the OUTPUT dir (never into DATA_PATH). The two meshes share
@@ -284,9 +300,10 @@ void run_config(
     const fs::path embedding_path_A = output_dir / "embedding_A.obj";
     const fs::path embedding_path_B = output_dir / "embedding_B.obj";
 
-    if (_config.embedding_mode == EmbeddingMode::Shared)
+    if (_config.pair_mode == PairMode::Stretched && START_FROM_GROUND_TRUTH)
     {
-        // "A on A": compute mesh A's embedding and use it for BOTH meshes.
+        // Ablation: compute mesh A's embedding and use it for BOTH meshes, so the
+        // initial map is the ground-truth correspondence.
         // init_map only computes an embedding when the file is absent, so writing
         // both files here makes it load ours (and skip its rotation alignment).
         if (!fs::exists(embedding_path_A) || !fs::exists(embedding_path_B))
@@ -302,6 +319,13 @@ void run_config(
             write_embedding(mesh_A, embedding, embedding_path_B);
             ISM_INFO("Wrote shared sphere embedding (initial map = ground truth)");
         }
+    }
+
+    if (_config.pair_mode == PairMode::SelfMap)
+    {
+        // Sanity: the two inputs really are the same mesh, so the ground-truth map
+        // is the identity and the correspondence error must stay at ~0.
+        ISM_INFO("Self-map consistency check: expecting the identity map");
     }
 
     // --- Init -------------------------------------------------------------
@@ -367,10 +391,10 @@ void run()
     csv << "config,stage,corr_mean,corr_median,corr_max,residual_mean,residual_max,n_verts_T\n";
 
     const std::vector<Config> configs = {
-        { EmbeddingMode::Shared,      EnergyMode::SymmetricDirichlet },
-        { EmbeddingMode::Shared,      EnergyMode::PrescribedMetric   },
-        { EmbeddingMode::Independent, EnergyMode::SymmetricDirichlet },
-        { EmbeddingMode::Independent, EnergyMode::PrescribedMetric   },
+        { PairMode::SelfMap,   EnergyMode::SymmetricDirichlet },
+        { PairMode::SelfMap,   EnergyMode::PrescribedMetric   },
+        { PairMode::Stretched, EnergyMode::SymmetricDirichlet },
+        { PairMode::Stretched, EnergyMode::PrescribedMetric   },
     };
 
     std::vector<TriMesh> lifted_As, lifted_Bs;
