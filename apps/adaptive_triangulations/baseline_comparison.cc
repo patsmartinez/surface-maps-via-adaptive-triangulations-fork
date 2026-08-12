@@ -69,6 +69,20 @@ const bool OPEN_VIEWER       = true;  // false = write screenshots instead
 /// HOLDS the map there. Isolates energy correctness from initialization quality.
 const bool START_FROM_GROUND_TRUTH = false;
 
+/// Run the COARSE phase with the prescribed energy too, not just the final phase.
+/// By default the coarse phase uses standard symmetric Dirichlet in every config,
+/// whose minimum for A->B is the as-isometric-as-possible map -- i.e. it actively
+/// pulls away from the prescription, and the final phase then has to undo that.
+const bool PRESCRIBED_IN_COARSE_PHASE = false;
+
+/// Disable all remeshing in the coarse AND final phases (T keeps the connectivity it
+/// has after the landmark phase). Diagnostic for whether remeshing is what breaks the
+/// map: if the A-on-A correspondence error stays at ~0 with this on, remeshing is the
+/// culprit; if it still drifts, the continuous optimization is.
+/// NOTE: with this on, T stays tiny (~15 vertices), so the metric residual is dominated
+/// by coarse-scale representation error -- read corr_mean, not residual.
+const bool DISABLE_REMESHING = false;
+
 /// Checkerboard transfer settings.
 /// Texcoords are built as (point[(dir+1)%3], point[(dir+2)%3]), so dir = 2 gives
 /// (x, y) -- the right choice for the L, which lies in the xy-plane and is extruded
@@ -389,16 +403,30 @@ void run_config(
     landmark_phase(map_state);
     report(map_state, name, "01_landmark", _csv);
 
-    coarse_phase(map_state);
+    const bool prescribed = (_config.energy_mode == EnergyMode::PrescribedMetric);
+
+    // Inlined coarse_phase(): that helper builds its own settings and accepts no
+    // overrides, so we replicate its two lines here to be able to change them.
+    {
+        ISM_INFO("#################### Starting Coarse Phase ####################");
+        AdaptiveTriangulationsSettings settings = coarse_phase_settings();
+        settings.use_prescribed_jacobian = prescribed && PRESCRIBED_IN_COARSE_PHASE;
+        settings.prescribed_metric_form = true;
+        if (DISABLE_REMESHING)
+            settings.allow_splits = settings.allow_collapses = settings.allow_flips = false;
+        optimize_with_remeshing(map_state, settings);
+    }
     report(map_state, name, "02_coarse", _csv);
 
-    // NOTE: landmark_phase and coarse_phase above always use the standard energy
-    // (they carry their own settings), so the prescribed energy only acts here.
-    AdaptiveTriangulationsSettings settings = fine_phase_settings();
-    settings.use_prescribed_jacobian = (_config.energy_mode == EnergyMode::PrescribedMetric);
-    settings.prescribed_metric_form = true; // metric form, not the legacy full-J* residual
-    settings.max_iterations = 50;
-    optimize_with_remeshing(map_state, settings);
+    {
+        AdaptiveTriangulationsSettings settings = fine_phase_settings();
+        settings.use_prescribed_jacobian = prescribed;
+        settings.prescribed_metric_form = true; // metric form, not the legacy full-J* residual
+        settings.max_iterations = 50;
+        if (DISABLE_REMESHING)
+            settings.allow_splits = settings.allow_collapses = settings.allow_flips = false;
+        optimize_with_remeshing(map_state, settings);
+    }
     report(map_state, name, "03_final", _csv);
 
     timer.stop();
@@ -426,7 +454,9 @@ void run()
 
     // CSV of all metrics, one row per (config, stage)
     const std::string suffix = (USE_FPS_LANDMARKS ? ("fps" + std::to_string(N_FPS_LANDMARKS)) : "default3")
-            + std::string(START_FROM_GROUND_TRUTH ? "_gt" : "");
+            + std::string(START_FROM_GROUND_TRUTH ? "_gt" : "")
+            + std::string(PRESCRIBED_IN_COARSE_PHASE ? "_pcoarse" : "")
+            + std::string(DISABLE_REMESHING ? "_noremesh" : "");
     std::ofstream csv(output_root / ("metrics_" + suffix + ".csv"));
     csv << "config,stage,corr_mean,corr_median,corr_max,residual_mean,residual_max,n_verts_T\n";
 
