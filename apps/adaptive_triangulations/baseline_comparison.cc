@@ -69,6 +69,16 @@ const bool OPEN_VIEWER       = true;  // false = write screenshots instead
 /// HOLDS the map there. Isolates energy correctness from initialization quality.
 const bool START_FROM_GROUND_TRUTH = false;
 
+/// Checkerboard transfer settings.
+/// Texcoords are built as (point[(dir+1)%3], point[(dir+2)%3]), so dir = 2 gives
+/// (x, y) -- the right choice for the L, which lies in the xy-plane and is extruded
+/// along z. (dir = 1 would give (z, x), i.e. constant across the L's main faces,
+/// which degenerates the checkerboard into stripes.)
+/// Raise TEXTURE_FACTOR if the checkers are too coarse: init_map normalizes the
+/// meshes to unit surface area, so their coordinates only span ~0.5.
+const int    TEXTURE_PROJECTION_DIR = 2;
+const double TEXTURE_FACTOR         = 4.0;
+
 // ---------------------------------------------------------------------------
 
 enum class PairMode
@@ -300,10 +310,18 @@ void run_config(
     const fs::path embedding_path_A = output_dir / "embedding_A.obj";
     const fs::path embedding_path_B = output_dir / "embedding_B.obj";
 
-    if (_config.pair_mode == PairMode::Stretched && START_FROM_GROUND_TRUTH)
+    // Share one embedding between both meshes when:
+    //  - SelfMap: the two inputs ARE the same mesh, so init_map computing two
+    //    embeddings independently could yield different ones and the initial map
+    //    would not be the identity -- which is exactly what this test must check.
+    //  - Stretched + START_FROM_GROUND_TRUTH: the optional ablation.
+    const bool share_embedding = (_config.pair_mode == PairMode::SelfMap)
+            || START_FROM_GROUND_TRUTH;
+
+    if (share_embedding)
     {
-        // Ablation: compute mesh A's embedding and use it for BOTH meshes, so the
-        // initial map is the ground-truth correspondence.
+        // Compute mesh A's embedding and use it for BOTH meshes, so the initial map
+        // is exactly the ground-truth correspondence (the identity, for SelfMap).
         // init_map only computes an embedding when the file is absent, so writing
         // both files here makes it load ours (and skip its rotation alignment).
         if (!fs::exists(embedding_path_A) || !fs::exists(embedding_path_B))
@@ -322,11 +340,7 @@ void run_config(
     }
 
     if (_config.pair_mode == PairMode::SelfMap)
-    {
-        // Sanity: the two inputs really are the same mesh, so the ground-truth map
-        // is the identity and the correspondence error must stay at ~0.
         ISM_INFO("Self-map consistency check: expecting the identity map");
-    }
 
     // --- Init -------------------------------------------------------------
     MapState map_state;
@@ -356,8 +370,11 @@ void run_config(
     coarse_phase(map_state);
     report(map_state, name, "02_coarse", _csv);
 
+    // NOTE: landmark_phase and coarse_phase above always use the standard energy
+    // (they carry their own settings), so the prescribed energy only acts here.
     AdaptiveTriangulationsSettings settings = fine_phase_settings();
     settings.use_prescribed_jacobian = (_config.energy_mode == EnergyMode::PrescribedMetric);
+    settings.prescribed_metric_form = true; // metric form, not the legacy full-J* residual
     settings.max_iterations = 50;
     optimize_with_remeshing(map_state, settings);
     report(map_state, name, "03_final", _csv);
@@ -436,11 +453,11 @@ void run()
             auto g = gv::grid();
             {
                 auto v = gv::view();
-                view_texture_frontal_projection_input(states[i], 0, 0, 1, 1.0, texture);
+                view_texture_frontal_projection_input(states[i], 0, 0, TEXTURE_PROJECTION_DIR, TEXTURE_FACTOR, texture);
             }
             {
                 auto v = gv::view();
-                view_texture_frontal_projection_input(states[i], 0, 1, 1, 1.0, texture);
+                view_texture_frontal_projection_input(states[i], 0, 1, TEXTURE_PROJECTION_DIR, TEXTURE_FACTOR, texture);
             }
         }
     }
