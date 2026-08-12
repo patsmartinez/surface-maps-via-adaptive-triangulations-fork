@@ -103,7 +103,11 @@ struct Config
         const std::string pair = (pair_mode == PairMode::SelfMap) ? "AonA" : "AonB";
         const std::string energy = (energy_mode == EnergyMode::SymmetricDirichlet) ? "dirichlet" : "prescribed";
         const std::string lm = USE_FPS_LANDMARKS ? ("fps" + std::to_string(N_FPS_LANDMARKS)) : "default3";
-        return pair + "_" + energy + "_" + lm;
+        // The sphere embedding is cached per output dir, and START_FROM_GROUND_TRUTH
+        // changes WHICH embedding is used -- so it must be part of the name, or a
+        // stale cache from a previous run is silently reused and the ablation is a no-op.
+        const std::string gt = (pair_mode == PairMode::Stretched && START_FROM_GROUND_TRUTH) ? "_gt" : "";
+        return pair + "_" + energy + "_" + lm + gt;
     }
 };
 
@@ -324,7 +328,12 @@ void run_config(
         // is exactly the ground-truth correspondence (the identity, for SelfMap).
         // init_map only computes an embedding when the file is absent, so writing
         // both files here makes it load ours (and skip its rotation alignment).
-        if (!fs::exists(embedding_path_A) || !fs::exists(embedding_path_B))
+        //
+        // Cache the embedding ONCE at the output root, then copy it into this config's
+        // paths on EVERY run -- never trust the per-config files to have been written
+        // with the current settings.
+        const fs::path shared_cache = _output_root / "embedding_shared.obj";
+        if (!fs::exists(shared_cache))
         {
             TriMesh mesh_A = read_mesh(mesh_path_A);
             center_mesh(mesh_A);
@@ -333,10 +342,11 @@ void run_config(
             const ExternalProperty<VH, Vec3d> embedding = multi_res_sphere_embedding(mesh_A);
             ISM_ASSERT(sphere_embedding_bijective(mesh_A, embedding));
 
-            write_embedding(mesh_A, embedding, embedding_path_A);
-            write_embedding(mesh_A, embedding, embedding_path_B);
-            ISM_INFO("Wrote shared sphere embedding (initial map = ground truth)");
+            write_embedding(mesh_A, embedding, shared_cache);
         }
+        fs::copy_file(shared_cache, embedding_path_A, fs::copy_options::overwrite_existing);
+        fs::copy_file(shared_cache, embedding_path_B, fs::copy_options::overwrite_existing);
+        ISM_INFO("Using shared sphere embedding (initial map = ground truth)");
     }
 
     if (_config.pair_mode == PairMode::SelfMap)
@@ -349,6 +359,18 @@ void run_config(
              { landmarks_path_A, landmarks_path_B },
              { embedding_path_A, embedding_path_B },
              false);
+
+    // Verify the shared embedding actually took effect. Without this, a stale cached
+    // embedding silently turns the ablation into a no-op and the run looks normal.
+    if (share_embedding)
+    {
+        double max_diff = 0.0;
+        for (auto vh : map_state.meshes_input[0].vertices())
+            max_diff = std::max(max_diff,
+                    (map_state.embeddings_input[0][vh] - map_state.embeddings_input[1][vh]).norm());
+        ISM_INFO("Shared embedding check: max |emb_A - emb_B| = " << max_diff);
+        ISM_ASSERT_L(max_diff, 1e-12);
+    }
 
     map_state.set_distortion_pairs(DistortionPairs::All);
 
@@ -403,7 +425,8 @@ void run()
     glow::SharedTexture2D texture = read_texture(DATA_PATH / "textures/checkerboard.png");
 
     // CSV of all metrics, one row per (config, stage)
-    const std::string suffix = USE_FPS_LANDMARKS ? ("fps" + std::to_string(N_FPS_LANDMARKS)) : "default3";
+    const std::string suffix = (USE_FPS_LANDMARKS ? ("fps" + std::to_string(N_FPS_LANDMARKS)) : "default3")
+            + std::string(START_FROM_GROUND_TRUTH ? "_gt" : "");
     std::ofstream csv(output_root / ("metrics_" + suffix + ".csv"));
     csv << "config,stage,corr_mean,corr_median,corr_max,residual_mean,residual_max,n_verts_T\n";
 
