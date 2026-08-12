@@ -171,18 +171,33 @@ void compute_correspondence_error(
     _median_error = errors[errors.size() / 2];
 }
 
+/// Distribution of the per-face residual.
+/// The mean alone cannot tell a heavy tail (a few badly-mismatched faces, e.g. in the
+/// transition band of the stretched L) from a uniformly wrong map -- and the two call
+/// for opposite fixes. Median and the tail fraction separate them.
+struct ResidualStats
+{
+    double mean = 0.0;         ///< unchanged from before: comparable across earlier runs
+    double median = 0.0;
+    double p90 = 0.0;
+    double max = 0.0;          ///< per-face max over the two singular values, then max over faces
+    double frac_gt_0p1 = 0.0;  ///< fraction of faces off by more than 10%
+    int n_faces = 0;           ///< faces actually measured; degenerate ones are skipped
+};
+
 /// Rotation-invariant residual against the prescribed field: singular values of
 /// J * J*^{-1}, which are all 1 exactly when the pullback metric matches the
 /// prescription. Computed for ALL configs (the baselines need it for evaluation
 /// even though they do not optimize it).
 void compute_metric_residual(
         const MapState& _map_state,
-        double& _mean_deviation,
-        double& _max_deviation)
+        ResidualStats& _stats)
 {
-    _mean_deviation = 0.0;
-    _max_deviation = 0.0;
-    int count = 0;
+    _stats = ResidualStats();
+
+    // Per-face deviation, kept so we can take percentiles at the end.
+    std::vector<double> devs;
+    devs.reserve(_map_state.mesh_T.n_faces());
 
     const int mesh_A_idx = _map_state.pairs_map_distortion[0].first;
     const int mesh_B_idx = _map_state.pairs_map_distortion[0].second;
@@ -239,14 +254,26 @@ void compute_metric_residual(
                 J_actual * V_local * Eigen::Vector2d(1.0 / sigma[0], 1.0 / sigma[1]).asDiagonal();
         const Eigen::Vector2d s = Eigen::JacobiSVD<Eigen::Matrix2d>(residual).singularValues();
 
-        const double dev = std::max(std::abs(s[0] - 1.0), std::abs(s[1] - 1.0));
-        _mean_deviation += (std::abs(s[0] - 1.0) + std::abs(s[1] - 1.0)) / 2.0;
-        _max_deviation = std::max(_max_deviation, dev);
-        count++;
+        devs.push_back((std::abs(s[0] - 1.0) + std::abs(s[1] - 1.0)) / 2.0);
+        _stats.max = std::max(_stats.max, std::max(std::abs(s[0] - 1.0), std::abs(s[1] - 1.0)));
     }
 
-    if (count > 0)
-        _mean_deviation /= (double)count;
+    if (devs.empty())
+        return;
+
+    for (const double d : devs)
+    {
+        _stats.mean += d;
+        if (d > 0.1)
+            _stats.frac_gt_0p1 += 1.0;
+    }
+    _stats.mean /= (double)devs.size();
+    _stats.frac_gt_0p1 /= (double)devs.size();
+
+    std::sort(devs.begin(), devs.end());
+    _stats.median = devs[devs.size() / 2];
+    _stats.p90 = devs[std::min(devs.size() - 1, (size_t)(0.9 * devs.size()))];
+    _stats.n_faces = (int)devs.size();
 }
 
 /// Report both metrics at a pipeline checkpoint, and append a row to the CSV.
@@ -260,17 +287,20 @@ void report(
     double corr_mean, corr_median, corr_max;
     compute_correspondence_error(_map_state, corr_mean, corr_median, corr_max);
 
-    double res_mean, res_max;
-    compute_metric_residual(_map_state, res_mean, res_max);
+    ResidualStats res;
+    compute_metric_residual(_map_state, res);
 
     ISM_INFO("[" << _config_name << " | " << _stage << "] "
              << "corr_err mean=" << corr_mean << " median=" << corr_median << " max=" << corr_max
-             << " | residual mean=" << res_mean << " max=" << res_max
+             << " | residual mean=" << res.mean << " median=" << res.median
+             << " p90=" << res.p90 << " max=" << res.max
+             << " frac>0.1=" << res.frac_gt_0p1 << " (" << res.n_faces << " faces)"
              << " | |V(T)|=" << _map_state.mesh_T.n_vertices());
 
     _csv << _config_name << "," << _stage << ","
          << corr_mean << "," << corr_median << "," << corr_max << ","
-         << res_mean << "," << res_max << ","
+         << res.mean << "," << res.median << "," << res.p90 << "," << res.max << ","
+         << res.frac_gt_0p1 << "," << res.n_faces << ","
          << _map_state.mesh_T.n_vertices() << "\n";
     _csv.flush();
 }
@@ -458,7 +488,9 @@ void run()
             + std::string(PRESCRIBED_IN_COARSE_PHASE ? "_pcoarse" : "")
             + std::string(DISABLE_REMESHING ? "_noremesh" : "");
     std::ofstream csv(output_root / ("metrics_" + suffix + ".csv"));
-    csv << "config,stage,corr_mean,corr_median,corr_max,residual_mean,residual_max,n_verts_T\n";
+    csv << "config,stage,corr_mean,corr_median,corr_max,"
+           "residual_mean,residual_median,residual_p90,residual_max,residual_frac_gt_0p1,"
+           "n_faces_T,n_verts_T\n";
 
     const std::vector<Config> configs = {
         { PairMode::SelfMap,   EnergyMode::SymmetricDirichlet },
