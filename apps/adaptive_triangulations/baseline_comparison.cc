@@ -83,6 +83,22 @@ const bool PRESCRIBED_IN_COARSE_PHASE = false;
 /// by coarse-scale representation error -- read corr_mean, not residual.
 const bool DISABLE_REMESHING = false;
 
+/// Weight of the map-distortion term -- the ONLY term the prescription lives in.
+/// The total objective is
+///     E_barrier*w_barrier + E_approx*w_approx + E_map*w_map + E_mesh*w_mesh
+/// and both coarse_phase_settings() and fine_phase_settings() ship
+/// w_map = w_mesh = w_approx = 1.0, so the prescription is one of three unit-weighted
+/// votes -- and the other two reward exactly what we observe improving (surface
+/// approximation, mesh quality) while being indifferent to where area goes.
+/// Sweep 1 / 10 / 100: residual drops => the prescription was outvoted, and the fix is
+/// this line; residual flat => it is being heard and ignored, i.e. the basin problem.
+/// Applied to BOTH energy modes on purpose, so the comparison controls for "more map
+/// weight helps regardless of WHICH map energy".
+/// Raise this rather than lowering w_approx: w_approx > 0 also gates
+/// update_assignment_vertices_to_T_faces inside the line search, so zeroing it would
+/// change the algorithm structurally instead of just reweighting it.
+const double W_MAP = 1.0;
+
 /// Per-iteration trace. The optimizer already exposes two callbacks and we just pass
 /// lambdas into them -- nothing in the algorithm changes.
 ///   _callback_for_optim  fires once per Newton iteration, inside the loop, after
@@ -139,7 +155,10 @@ struct Config
         // changes WHICH embedding is used -- so it must be part of the name, or a
         // stale cache from a previous run is silently reused and the ablation is a no-op.
         const std::string gt = (pair_mode == PairMode::Stretched && START_FROM_GROUND_TRUTH) ? "_gt" : "";
-        return pair + "_" + energy + "_" + lm + gt;
+        // Same reasoning as gt: w_map changes the result, so it must change the output
+        // dir, or a cached embedding from a different weight gets reused silently.
+        const std::string wm = (W_MAP == 1.0) ? "" : ("_wmap" + std::to_string((int)W_MAP));
+        return pair + "_" + energy + "_" + lm + gt + wm;
     }
 };
 
@@ -598,6 +617,7 @@ void run_config(
         AdaptiveTriangulationsSettings settings = coarse_phase_settings();
         settings.use_prescribed_jacobian = prescribed && PRESCRIBED_IN_COARSE_PHASE;
         settings.prescribed_metric_form = true;
+        settings.w_map = W_MAP;
         if (DISABLE_REMESHING)
             settings.allow_splits = settings.allow_collapses = settings.allow_flips = false;
         optimize_with_remeshing(map_state, settings, "",
@@ -609,6 +629,7 @@ void run_config(
         AdaptiveTriangulationsSettings settings = fine_phase_settings();
         settings.use_prescribed_jacobian = prescribed;
         settings.prescribed_metric_form = true; // metric form, not the legacy full-J* residual
+        settings.w_map = W_MAP;
         settings.max_iterations = 50;
         if (DISABLE_REMESHING)
             settings.allow_splits = settings.allow_collapses = settings.allow_flips = false;
@@ -644,7 +665,8 @@ void run()
     const std::string suffix = (USE_FPS_LANDMARKS ? ("fps" + std::to_string(N_FPS_LANDMARKS)) : "default3")
             + std::string(START_FROM_GROUND_TRUTH ? "_gt" : "")
             + std::string(PRESCRIBED_IN_COARSE_PHASE ? "_pcoarse" : "")
-            + std::string(DISABLE_REMESHING ? "_noremesh" : "");
+            + std::string(DISABLE_REMESHING ? "_noremesh" : "")
+            + std::string(W_MAP == 1.0 ? "" : ("_wmap" + std::to_string((int)W_MAP)));
     std::ofstream csv(output_root / ("metrics_" + suffix + ".csv"));
     csv << "config,stage,corr_mean,corr_median,corr_max,"
            "residual_mean,residual_mean_aw,residual_median,residual_median_aw,"
