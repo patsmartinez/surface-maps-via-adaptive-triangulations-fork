@@ -23,11 +23,15 @@
  * (For J = I the SVD is degenerate and U, V are arbitrary, but M* = V*I*V^T = I
  * regardless -- the metric form is immune to that ambiguity.)
  *
- * Ground-truth correspondence error is the primary metric: the metric residual is
- * what we minimize (a training loss), and under the gauge freedom of a metric
- * prescription it can be ~0 while the map is visibly wrong.
+ * Read BOTH metrics; they can disagree sharply and each catches what the other misses.
+ * Ground-truth correspondence error is the primary one, because the residual is what we
+ * minimize (a training loss) and a metric prescription has gauge freedom, so it can sit
+ * at ~0 while the map is visibly wrong. But the converse happens too: our best
+ * from-scratch map has corr 0.0074 and residual 0.51, while a ground-truth start gives
+ * corr 0.0132 and residual 0.011 -- worse correspondence, 46x better residual. Those are
+ * two different local minima, which is how the basin problem was isolated.
  *
- * Toggle FPS landmarks with the flags below; re-run to get another 4 results.
+ * Set one flag below, re-run, get another 4 configs x 4 stages of CSV.
  */
 #include <SurfaceMaps/Init.hh>
 #include <SurfaceMaps/Types.hh>
@@ -57,65 +61,84 @@ namespace SurfaceMaps
 
 // ---------------------------------------------------------------------------
 // Settings. Toggle these and re-run to get another set of 4 results.
+//
+// Two former ablations are gone because their answer is final:
+//  - Default-3 landmarks. Pathological: v0=(2,1,0), v1=(1,2,0), v2=(1.33,1.33,0) are
+//    coplanar at z=0 and clustered within 1.4 units on a mesh of diameter 4.05, so
+//    align_rotation fits a global sphere rotation from nothing. That is what produced
+//    the whole-surface rotation plus two bunching singularities. FPS always now.
+//  - DISABLE_REMESHING. Refinement is essential to the prescription: with it off T
+//    stays at ~15 vertices, the residual sticks at ~0.10 against 0.008, and prescribed
+//    degenerates to dirichlet. No reason to run it again.
 // ---------------------------------------------------------------------------
 
-const bool USE_FPS_LANDMARKS = false; // false = default landmarks (first 3 vertices)
-const int  N_FPS_LANDMARKS   = 8;     // only used when USE_FPS_LANDMARKS is true
-const bool OPEN_VIEWER       = true;  // false = write screenshots instead
+/// 8 / 16 / 32 swept. 16 was marginally best (corr 0.0062 vs 0.0074) and gave the widest
+/// prescribed-vs-dirichlet gap (4.6x); 32 degrades 2.3x and collapses the gap to 1.03x,
+/// because hard landmark constraints start determining the answer instead of the energy.
+/// Held at 8 so the W_MESH sweep below is directly comparable to the W_MAP sweep.
+const int  N_FPS_LANDMARKS = 8;
+const bool OPEN_VIEWER     = true; // false = write screenshots instead
 
-/// Optional ablation, applies to the A-on-B configs only: give mesh B the SAME sphere
-/// embedding as mesh A. The two L meshes share connectivity, so the initial map is then
-/// exactly the ground-truth correspondence, and the question becomes whether the energy
-/// HOLDS the map there. Isolates energy correctness from initialization quality.
+/// Ablation, A-on-B configs only: give mesh B the SAME sphere embedding as mesh A.
+/// The two L meshes share connectivity, so the initial map is then exactly the
+/// ground-truth correspondence, and the question becomes whether the energy HOLDS it.
+/// Our sharpest diagnostic: at W_MAP = 100 it showed dirichlet drifting AWAY from the
+/// correct map (0.0160 -> 0.0258) while prescribed holds and improves it
+/// (0.00515 -> 0.00332) -- a 7.8x gap, and the demonstration that the correct map is
+/// not the as-isometric-as-possible one.
 const bool START_FROM_GROUND_TRUTH = false;
 
-/// Run the COARSE phase with the prescribed energy too, not just the final phase.
-/// By default the coarse phase uses standard symmetric Dirichlet in every config,
-/// whose minimum for A->B is the as-isometric-as-possible map -- i.e. it actively
-/// pulls away from the prescription, and the final phase then has to undo that.
-const bool PRESCRIBED_IN_COARSE_PHASE = false;
+/// Run the COARSE phase with the prescribed energy too, not just the fine phase.
+/// At W_MAP = 1 this helped from scratch (0.0471 -> 0.0326) and hurt from the
+/// ground-truth start (0.0132 -> 0.0151): a noisy-but-roughly-right signal that
+/// dominates noise when far from the answer and contributes only noise when already
+/// there. Worth re-checking now that the weights have moved, so it stays a flag.
+const bool PRESCRIBED_IN_COARSE_PHASE = true;
 
-/// Disable all remeshing in the coarse AND final phases (T keeps the connectivity it
-/// has after the landmark phase). Diagnostic for whether remeshing is what breaks the
-/// map: if the A-on-A correspondence error stays at ~0 with this on, remeshing is the
-/// culprit; if it still drifts, the continuous optimization is.
-/// NOTE: with this on, T stays tiny (~15 vertices), so the metric residual is dominated
-/// by coarse-scale representation error -- read corr_mean, not residual.
-const bool DISABLE_REMESHING = false;
-
-/// Weight of the map-distortion term -- the ONLY term the prescription lives in.
-/// The total objective is
-///     E_barrier*w_barrier + E_approx*w_approx + E_map*w_map + E_mesh*w_mesh
-/// and both coarse_phase_settings() and fine_phase_settings() ship
-/// w_map = w_mesh = w_approx = 1.0, so the prescription is one of three unit-weighted
-/// votes -- and the other two reward exactly what we observe improving (surface
-/// approximation, mesh quality) while being indifferent to where area goes.
-/// Sweep 1 / 10 / 100: residual drops => the prescription was outvoted, and the fix is
-/// this line; residual flat => it is being heard and ignored, i.e. the basin problem.
-/// Applied to BOTH energy modes on purpose, so the comparison controls for "more map
-/// weight helps regardless of WHICH map energy".
-/// Raise this rather than lowering w_approx: w_approx > 0 also gates
-/// update_assignment_vertices_to_T_faces inside the line search, so zeroing it would
-/// change the algorithm structurally instead of just reweighting it.
+/// Weight of the map-distortion term -- the only term the prescription lives in.
+/// SWEEP DONE (1 / 10 / 100): the prescription was being outvoted. At 100, A-on-B
+/// prescribed improves 0.0326 -> 0.00742 corr_mean, the prescribed-vs-dirichlet gap
+/// widens 1.4x -> 3.5x, and the A-on-A self-map drift collapses 0.0195 -> 0.000427
+/// (which retired the "continuous optimizer breaks the symmetry" mystery -- it was
+/// the weighting all along).
+/// HOLD AT 1.0 while sweeping W_MESH below: that separation is the point of the sweep.
 const double W_MAP = 1.0;
 
-/// Per-iteration trace. The optimizer already exposes two callbacks and we just pass
-/// lambdas into them -- nothing in the algorithm changes.
-///   _callback_for_optim  fires once per Newton iteration, inside the loop, after
-///                        embeddings_T and the local bases have been updated
-///                        (OptimizeMap.cc: "after_optimization").
-///   _callback_for_remesh fires three times per remeshing pass
-///                        (Remeshing.cc: "after_splits" / "after_collapses" / "after_flips").
-/// Because they are separate, a jump in the metrics can be attributed to a continuous
-/// Newton step or to one specific remeshing operation -- which no end-of-phase number
-/// can tell you. Writes <config>/trace.csv, one row per step.
-const bool TRACE_ITERATIONS = true;
-/// Also dump lifted meshes per traced step, for an animation. Off-by-default would make
-/// the trace CSV-only; the meshes are what you actually watch.
-const bool TRACE_WRITE_MESHES = true;
+/// Weight of the mesh-quality term. THIS IS THE CURRENT SWEEP: 1 / 0.1 / 0.01, with
+/// W_MAP held at 1.
+///
+/// Why this term specifically. eval_mesh_energy_triangle_T builds an ideal EQUILATERAL
+/// triangle of side tel and runs symmetric Dirichlet between the lifted T triangle and
+/// that ideal -- once per input mesh. So it demands every T triangle be equilateral on
+/// A *and* equilateral on B, and those two demands together imply J is a rotation.
+/// E_mesh therefore carries a hidden isometry prior on the map, and it is mutually
+/// UNSATISFIABLE with an anisotropic prescription: a triangle cannot be equilateral on
+/// both sides when sigma = (2, 1). E_approx, by contrast, is indifferent to J -- it only
+/// wants T to hug the surfaces.
+///
+/// So E_mesh is the likely antagonist, and W_MAP = 100 escaped it only incidentally, by
+/// down-weighting everything else at once. Prediction: lowering W_MESH alone recovers
+/// most of the W_MAP = 100 gain. If it does, the honest fix is prescription-aware ideal
+/// triangles -- apply the already-looked-up V and Sigma to the ideal on the B side --
+/// rather than a 100x multiplier on the map term.
+const double W_MESH = 1.0;
+
+/// Per-iteration trace, via the optimizer's own two callbacks (nothing in the algorithm
+/// changes). _callback_for_optim fires once per Newton iteration, inside the loop, after
+/// embeddings_T and the local bases are updated (OptimizeMap.cc "after_optimization");
+/// _callback_for_remesh fires three times per remeshing pass (Remeshing.cc
+/// "after_splits" / "after_collapses" / "after_flips"). Because they are separate, a
+/// change can be attributed to a continuous step or to one specific remeshing operation.
+///
+/// Its question is answered: the residual jumps at after_splits and never at Newton
+/// steps, while corr stays flat across those same splits -- so refinement sharpens the
+/// MEASUREMENT rather than degrading the map, and "the fine phase degrades the residual"
+/// was wrong. Kept because nothing else can attribute a change to an operation, but OFF
+/// by default: it lifts all 786 input vertices every frame and roughly doubles runtime.
+const bool TRACE_ITERATIONS   = false;
+const bool TRACE_WRITE_MESHES = false;
 /// Dump a mesh only every Nth traced step (the CSV always gets every step).
-/// Raise this if the frame count gets unwieldy; the coarse phase is the interesting part.
-const int TRACE_MESH_STRIDE = 1;
+const int  TRACE_MESH_STRIDE  = 1;
 
 /// Checkerboard transfer settings.
 /// Texcoords are built as (point[(dir+1)%3], point[(dir+2)%3]), so dir = 2 gives
@@ -128,6 +151,30 @@ const int    TEXTURE_PROJECTION_DIR = 2;
 const double TEXTURE_FACTOR         = 4.0;
 
 // ---------------------------------------------------------------------------
+
+/// Compact, filesystem-safe tag for a non-default weight:
+/// 100 -> "_wmap100", 0.01 -> "_wmesh0p01", and "" at the default of 1.0 so runs at the
+/// default keep the output names they already have.
+///
+/// Anything that changes the RESULT must appear in the output directory name. The sphere
+/// embedding is cached per config dir, and a stale one silently turns an ablation into a
+/// no-op -- that trap already cost us one plausible-looking but meaningless run.
+std::string weight_tag(
+        const std::string& _name,
+        const double _w)
+{
+    if (_w == 1.0)
+        return "";
+
+    std::string s = std::to_string(_w); // e.g. "0.010000"
+    while (!s.empty() && s.back() == '0')
+        s.pop_back();
+    if (!s.empty() && s.back() == '.')
+        s.pop_back();
+    std::replace(s.begin(), s.end(), '.', 'p');
+
+    return "_" + _name + s;
+}
 
 enum class PairMode
 {
@@ -150,15 +197,12 @@ struct Config
     {
         const std::string pair = (pair_mode == PairMode::SelfMap) ? "AonA" : "AonB";
         const std::string energy = (energy_mode == EnergyMode::SymmetricDirichlet) ? "dirichlet" : "prescribed";
-        const std::string lm = USE_FPS_LANDMARKS ? ("fps" + std::to_string(N_FPS_LANDMARKS)) : "default3";
-        // The sphere embedding is cached per output dir, and START_FROM_GROUND_TRUTH
-        // changes WHICH embedding is used -- so it must be part of the name, or a
-        // stale cache from a previous run is silently reused and the ablation is a no-op.
+        const std::string lm = "fps" + std::to_string(N_FPS_LANDMARKS);
+        // START_FROM_GROUND_TRUTH changes WHICH embedding is used, so it has to be in
+        // the name -- see the note on weight_tag above.
         const std::string gt = (pair_mode == PairMode::Stretched && START_FROM_GROUND_TRUTH) ? "_gt" : "";
-        // Same reasoning as gt: w_map changes the result, so it must change the output
-        // dir, or a cached embedding from a different weight gets reused silently.
-        const std::string wm = (W_MAP == 1.0) ? "" : ("_wmap" + std::to_string((int)W_MAP));
-        return pair + "_" + energy + "_" + lm + gt + wm;
+        return pair + "_" + energy + "_" + lm + gt
+             + weight_tag("wmap", W_MAP) + weight_tag("wmesh", W_MESH);
     }
 };
 
@@ -488,18 +532,8 @@ void run_config(
     const fs::path landmarks_path_B = output_dir / "landmarks_B.pinned";
     {
         const TriMesh mesh_A = read_mesh(mesh_path_A);
-        std::vector<VH> landmarks;
-        if (USE_FPS_LANDMARKS)
-        {
-            landmarks = farthest_point_sampling(mesh_A, N_FPS_LANDMARKS);
-            ISM_INFO("FPS landmarks (" << landmarks.size() << "): ");
-        }
-        else
-        {
-            for (int i = 0; i < 3; ++i)
-                landmarks.push_back(VH(i));
-            ISM_INFO("Default landmarks (first 3 vertices)");
-        }
+        const std::vector<VH> landmarks = farthest_point_sampling(mesh_A, N_FPS_LANDMARKS);
+        ISM_INFO("FPS landmarks (" << landmarks.size() << ")");
         write_landmarks_pinned(landmarks, landmarks_path_A, {}, true);
         write_landmarks_pinned(landmarks, landmarks_path_B, {}, true);
     }
@@ -618,8 +652,7 @@ void run_config(
         settings.use_prescribed_jacobian = prescribed && PRESCRIBED_IN_COARSE_PHASE;
         settings.prescribed_metric_form = true;
         settings.w_map = W_MAP;
-        if (DISABLE_REMESHING)
-            settings.allow_splits = settings.allow_collapses = settings.allow_flips = false;
+        settings.w_mesh = W_MESH;
         optimize_with_remeshing(map_state, settings, "",
                                 tracer("coarse_optim"), tracer("coarse_remesh"));
     }
@@ -630,9 +663,8 @@ void run_config(
         settings.use_prescribed_jacobian = prescribed;
         settings.prescribed_metric_form = true; // metric form, not the legacy full-J* residual
         settings.w_map = W_MAP;
+        settings.w_mesh = W_MESH;
         settings.max_iterations = 50;
-        if (DISABLE_REMESHING)
-            settings.allow_splits = settings.allow_collapses = settings.allow_flips = false;
         optimize_with_remeshing(map_state, settings, "",
                                 tracer("fine_optim"), tracer("fine_remesh"));
     }
@@ -662,11 +694,10 @@ void run()
     glow::SharedTexture2D texture = read_texture(DATA_PATH / "textures/checkerboard.png");
 
     // CSV of all metrics, one row per (config, stage)
-    const std::string suffix = (USE_FPS_LANDMARKS ? ("fps" + std::to_string(N_FPS_LANDMARKS)) : "default3")
+    const std::string suffix = "fps" + std::to_string(N_FPS_LANDMARKS)
             + std::string(START_FROM_GROUND_TRUTH ? "_gt" : "")
             + std::string(PRESCRIBED_IN_COARSE_PHASE ? "_pcoarse" : "")
-            + std::string(DISABLE_REMESHING ? "_noremesh" : "")
-            + std::string(W_MAP == 1.0 ? "" : ("_wmap" + std::to_string((int)W_MAP)));
+            + weight_tag("wmap", W_MAP) + weight_tag("wmesh", W_MESH);
     std::ofstream csv(output_root / ("metrics_" + suffix + ".csv"));
     csv << "config,stage,corr_mean,corr_median,corr_max,"
            "residual_mean,residual_mean_aw,residual_median,residual_median_aw,"
