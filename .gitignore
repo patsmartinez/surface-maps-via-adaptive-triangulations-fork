@@ -5,3 +5,4 @@ build
 apps/nonpublic
 CMakeLists.txt.user*
 apps/adaptive_triangulations/__pycache__
+build-headless

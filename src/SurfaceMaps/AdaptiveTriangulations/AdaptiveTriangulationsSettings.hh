@@ -24,6 +24,19 @@ struct AdaptiveTriangulationsSettings
     bool use_prescribed_jacobian = false;
     bool prescribed_metric_form = true; // Metric form (V, sigma only, U ignored); false = full J* residual
 
+    /// Make E_mesh prescription-aware instead of merely down-weighting it.
+    ///
+    /// E_mesh compares each lifted T triangle to an ideal EQUILATERAL of side tel, once
+    /// per input mesh. Demanding equilateral on A *and* on B implies J is a rotation, so
+    /// E_mesh carries a hidden isometry prior that is mutually unsatisfiable with an
+    /// anisotropic prescription. With this on, the B-side ideal instead carries the
+    /// prescribed anisotropy (see prescribed_ideal_shape), so satisfying both terms
+    /// implies J ~ J* rather than J ~ rotation.
+    ///
+    /// Reduces EXACTLY to the old behaviour when J* = I, so A-on-A rows must stay
+    /// bit-identical. Requires use_prescribed_jacobian.
+    bool prescribed_mesh_ideal = false;
+
     // Weights
     double w_barrier = 1e-4;
     double w_reg = 0.0;

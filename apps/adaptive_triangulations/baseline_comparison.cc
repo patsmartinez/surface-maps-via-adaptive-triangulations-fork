@@ -38,8 +38,10 @@
 #include <SurfaceMaps/Utils/IO.hh>
 #include <SurfaceMaps/Utils/FarthestPointSampling.hh>
 #include <SurfaceMaps/Utils/MeshNormalization.hh>
+#include <SurfaceMaps/Viewer/Colors.hh> // pure Vec4f constants, no OpenGL
+#if ISM_HAS_VIEWER
 #include <SurfaceMaps/Viewer/MeshView.hh>
-#include <SurfaceMaps/Viewer/Colors.hh>
+#endif
 #include <SurfaceMaps/AdaptiveTriangulations/Helpers.hh>
 #include <SurfaceMaps/AdaptiveTriangulations/MapState.hh>
 #include <SurfaceMaps/AdaptiveTriangulations/PrescribedJacobianField.hh>
@@ -49,7 +51,10 @@
 #include <SurfaceMaps/AdaptiveTriangulations/AssignVerticesToFaces.hh>
 #include <SurfaceMaps/AdaptiveTriangulations/EvaluationMetrics.hh>
 #include <SurfaceMaps/AdaptiveTriangulations/LiftToSurface.hh>
+#include <SurfaceMaps/AdaptiveTriangulations/PrescribedResidual.hh>
+#if ISM_HAS_VIEWER
 #include <SurfaceMaps/AdaptiveTriangulations/Visualization.hh>
+#endif
 #include <SurfaceMaps/MultiRes/MultiResSphereEmbedding.hh>
 
 #include <Eigen/SVD>
@@ -72,11 +77,26 @@ namespace SurfaceMaps
 //    degenerates to dirichlet. No reason to run it again.
 // ---------------------------------------------------------------------------
 
+/// The mesh pair. Both meshes MUST share connectivity: the ground-truth correspondence
+/// metric assumes vertex i of A maps to vertex i of B, and extract_jacobian_field pairs
+/// faces by index. Verify with
+///   diff <(sed 's#/[0-9]*##g' A.obj | grep '^f ') <(sed 's#/[0-9]*##g' B.obj | grep '^f ')
+/// (strip the /vt/vn indices first -- normals legitimately differ between the two).
+///
+///   l_shape: 786 verts. Identity for x <= 2.08, x -> 2x-1.93 for x >= 2.42, ~101-face
+///            transition band. Flat faces + sharp edges, so all curvature sits at the
+///            cone points and the developable regions give the energy soft modes.
+///   u_shape: 5852 verts. Base stretched 2x in x, both arms translated +-0.65 rigidly,
+///            transition at |x| ~ 0.65. 7.4x bigger, so runs are substantially slower.
+const std::string MESH_DIR = "meshes/l_shape";
+const std::string MESH_A   = "newL.obj";
+const std::string MESH_B   = "stretchedL.obj";
+
 /// 8 / 16 / 32 swept. 16 was marginally best (corr 0.0062 vs 0.0074) and gave the widest
 /// prescribed-vs-dirichlet gap (4.6x); 32 degrades 2.3x and collapses the gap to 1.03x,
 /// because hard landmark constraints start determining the answer instead of the energy.
 /// Held at 8 so the W_MESH sweep below is directly comparable to the W_MAP sweep.
-const int  N_FPS_LANDMARKS = 8;
+const int  N_FPS_LANDMARKS = 16;
 const bool OPEN_VIEWER     = true; // false = write screenshots instead
 
 /// Ablation, A-on-B configs only: give mesh B the SAME sphere embedding as mesh A.
@@ -122,6 +142,82 @@ const double W_MAP = 1.0;
 /// triangles -- apply the already-looked-up V and Sigma to the ideal on the B side --
 /// rather than a 100x multiplier on the map term.
 const double W_MESH = 1.0;
+
+/// PRIORITY 3: make E_mesh prescription-aware instead of down-weighting it.
+///
+/// E_mesh builds an ideal EQUILATERAL triangle of side tel and runs symmetric Dirichlet
+/// between the lifted T triangle and that ideal, once per input mesh -- so it demands
+/// every T triangle be equilateral on A *and* on B, which together imply J is a rotation.
+/// That isometry prior is mutually unsatisfiable with an anisotropic prescription.
+///
+/// With this on, the B-side ideal instead carries the prescribed anisotropy: the ideal's
+/// edge vectors are multiplied by S = (M*/sqrt(det M*))^(1/2), which is SPD with det 1,
+/// so the ideal gets the prescribed SHAPE and keeps the sizing field's AREA. Satisfying
+/// both terms then implies J ~ J* rather than J ~ rotation.
+///
+/// WHY THIS AND NOT MORE WEIGHT TUNING. On the sphere pair, at matched T resolution
+/// (2188 vs 2120 faces) and where T out-resolves the field 6x so the lookup is not
+/// binding, dropping W_MESH 1.0 -> 0.1 improved the PRESCRIBED residual 4.4x
+/// (0.0687 -> 0.0156) while improving the DIRICHLET control only 1.18x
+/// (0.1571 -> 0.1329). That differential is the isometry prior, isolated. And no single
+/// W_MESH works across shapes (L wants 0.01, U wants 1.0, sphere wants 0.1), so
+/// down-weighting leaves a per-mesh tuning parameter behind.
+///
+/// PREDICTION, pre-registered against the nine baselines already on disk: with this on at
+/// W_MESH = 1, each shape should reach roughly its own best-W_MESH residual --
+/// L ~0.051, U ~0.223, sphere ~0.014 -- untuned.
+///
+/// Reduces EXACTLY to the old ideal when J* = I, so the A-on-A rows are the correctness
+/// check: they must stay bit-identical to a run with this off. (Verified: all six A-on-A
+/// rows across the three shapes are bit-identical.)
+///
+/// RESULT (2026-10-22), in two parts -- read both, the first one alone is misleading.
+///
+/// FROM THE DEFAULT INITIALIZATION the prediction above FAILED:
+///   - Alone at W_MESH = 1 it buys 1.21x (L), 1.29x (sphere), and COSTS 14% (U).
+///   - W_MESH down-weighting alone buys 4.45x (L), 4.89x (sphere).
+///   - On top of W_MESH = 0.01 it buys NOTHING: 0.83x (L), 0.95x (sphere).
+/// So the isometry prior is a real but minor effect, fully subsumed by down-weighting.
+/// E_mesh's harm is its MAGNITUDE, not its BIAS -- giving it the correct anisotropic
+/// target changes little; how hard it pushes is what matters.
+///
+/// FROM THE MOBIUS-FITTED INITIALIZATION it works, and the first reading was confounded.
+/// With MOBIUS_FITTED_EMBEDDING_B = true and W_MESH = 0.01 on the L:
+///   mobius alone  0.05113 -> 0.04663 (1.10x)   -- despite a 1.76x better INITIAL residual
+///   pmesh alone   0.05113 -> 0.06145 (0.83x)   -- hurts
+///   BOTH          0.05113 -> 0.03515 (1.45x)   -- vs 0.91x if the two were independent
+/// A real interaction (~1.6x). Mobius supplies a better basin; E_mesh's isometry prior
+/// drags the map back off it; pmesh removes the prior so the advantage survives. Neither
+/// alone is worth anything.
+///
+/// BEST KNOWN CONFIGURATION on the L: W_MESH = 0.01 + PRESCRIBED_MESH_IDEAL
+///   + MOBIUS_FITTED_EMBEDDING_B. Prescribed 0.03515 res / 0.00247 corr / 0.01918
+///   corr_max against a dirichlet 0.10924 / 0.01443 / 0.07048 and an A-on-A floor of
+///   0.01576 / 0.00143 / 0.01861 -- i.e. 3.1x / 5.8x / 3.7x over dirichlet, with the
+///   WORST-CASE correspondence error now sitting AT the self-map floor.
+///
+/// Parked OFF so this file still reproduces the plain baseline; flip both (and W_MESH)
+/// to get the best result. Its one regression (the U, 0.86x) is lookup-driven: pmesh
+/// consumes the centroid lookup's output, so it amplifies lookup error where the lookup
+/// is worst. Its benefit is monotone in T's resolution relative to the prescribed field
+/// -- U 0.16x of the field: 0.86x; L 0.45x: 1.21x; sphere 6.84x: 1.29x.
+const bool PRESCRIBED_MESH_IDEAL = false;
+
+/// Give mesh B the MOBIUS-FITTED sphere embedding produced by the `mobius_probe` app
+/// (`output/mobius_probe_<shape>/embedding_B_mobius_fitted.obj`), instead of the one
+/// multi_res_sphere_embedding + align_rotation produced.
+///
+/// The probe fits a 6-DOF Mobius transformation of B's embedding to minimize the INITIAL
+/// residual: on the L that takes 0.2303 -> 0.1302 (1.77x), of which a landmark-only fit
+/// reaches 0.1466 (84% of the achievable gain). A Mobius transformation of the sphere is a
+/// diffeomorphism, so the transformed embedding is still bijective, and J* is untouched
+/// (extract_jacobian_field reads only the two meshes).
+///
+/// Its purpose here is as a CONTROL on the priority-3 refutation: if E_mesh's isometry
+/// prior looked minor only because the map starts far from the answer, then starting
+/// closer should make PRESCRIBED_MESH_IDEAL matter more. Applies to A-on-B configs only --
+/// SelfMap must keep both embeddings identical, and START_FROM_GROUND_TRUTH overrides it.
+const bool MOBIUS_FITTED_EMBEDDING_B = false;
 
 /// Per-iteration trace, via the optimizer's own two callbacks (nothing in the algorithm
 /// changes). _callback_for_optim fires once per Newton iteration, inside the loop, after
@@ -202,7 +298,10 @@ struct Config
         // the name -- see the note on weight_tag above.
         const std::string gt = (pair_mode == PairMode::Stretched && START_FROM_GROUND_TRUTH) ? "_gt" : "";
         return pair + "_" + energy + "_" + lm + gt
-             + weight_tag("wmap", W_MAP) + weight_tag("wmesh", W_MESH);
+             + weight_tag("wmap", W_MAP) + weight_tag("wmesh", W_MESH)
+             + (PRESCRIBED_MESH_IDEAL ? "_pmesh" : "")
+             + ((pair_mode == PairMode::Stretched && MOBIUS_FITTED_EMBEDDING_B
+                 && !START_FROM_GROUND_TRUTH) ? "_mob" : "");
     }
 };
 
@@ -252,176 +351,9 @@ void compute_correspondence_error(
     _median_error = errors[errors.size() / 2];
 }
 
-/// Distribution of the per-face residual.
-///
-/// Two things the plain mean cannot do:
-///
-/// (1) COMPARE ACROSS STAGES. The unweighted average over T faces changes meaning when
-///     refinement takes T from ~50 faces to ~630, because refinement concentrates small
-///     faces wherever it chooses to refine. The *_aw fields weight each face by the area
-///     of the mesh-A material it covers, which is stage-independent; compare those.
-///     The unweighted fields are kept unchanged so older CSVs remain comparable, and the
-///     gap between `mean` and `mean_aw` is itself a readout of how much the unweighted
-///     statistic is being distorted.
-///
-/// (2) SAY WHAT KIND OF WRONG. The residual J*J*^-1 has singular values s0, s1, and
-///     log-splits into two independent parts:
-///         area  = |log(s0*s1)|  -- material is in the wrong PLACE (mis-allocated area)
-///         shape = |log(s0/s1)|  -- material is the wrong SHAPE   (sheared / anisotropy off)
-///     Both vanish exactly at s0 = s1 = 1. Area-dominant points at coarse-scale
-///     representativeness (the centroid lookup smearing the prescription); shape-dominant
-///     points at local shear, i.e. sliding and initialization.
-struct ResidualStats
-{
-    double mean = 0.0;            ///< unweighted; unchanged, comparable with earlier runs
-    double mean_aw = 0.0;         ///< area-weighted -- the one to compare ACROSS stages
-    double median = 0.0;
-    double median_aw = 0.0;
-    double p90 = 0.0;
-    double max = 0.0;             ///< per-face max over the two singular values, then max over faces
-    double frac_gt_0p1 = 0.0;     ///< fraction of faces off by more than 10%
-    double frac_gt_0p1_aw = 0.0;  ///< fraction of AREA off by more than 10%
-    double area_part_aw = 0.0;    ///< area-weighted mean |log(s0*s1)|
-    double shape_part_aw = 0.0;   ///< area-weighted mean |log(s0/s1)|
-    int n_faces = 0;              ///< faces actually measured; degenerate ones are skipped
-};
-
-/// Percentile of (value, weight) pairs, sorted ascending by value.
-double weighted_percentile(
-        const std::vector<std::pair<double, double>>& _sorted,
-        const double _total_weight,
-        const double _q)
-{
-    double acc = 0.0;
-    for (const auto& vw : _sorted)
-    {
-        acc += vw.second;
-        if (acc >= _q * _total_weight)
-            return vw.first;
-    }
-    return _sorted.back().first;
-}
-
-/// Rotation-invariant residual against the prescribed field: singular values of
-/// J * J*^{-1}, which are all 1 exactly when the pullback metric matches the
-/// prescription. Computed for ALL configs (the baselines need it for evaluation
-/// even though they do not optimize it).
-void compute_metric_residual(
-        const MapState& _map_state,
-        ResidualStats& _stats)
-{
-    _stats = ResidualStats();
-
-    // (deviation, area of the lifted A triangle), kept so we can take percentiles
-    // and area-weighted means at the end.
-    std::vector<std::pair<double, double>> devs;
-    devs.reserve(_map_state.mesh_T.n_faces());
-    double total_area = 0.0;
-
-    const int mesh_A_idx = _map_state.pairs_map_distortion[0].first;
-    const int mesh_B_idx = _map_state.pairs_map_distortion[0].second;
-
-    for (auto fh : _map_state.mesh_T.faces())
-    {
-        VH vh_a, vh_b, vh_c;
-        handles(_map_state.mesh_T, fh, vh_a, vh_b, vh_c);
-
-        const Vec3d a_sphere = _map_state.embeddings_T[0][vh_a];
-        const Vec3d b_sphere = _map_state.embeddings_T[0][vh_b];
-        const Vec3d c_sphere = _map_state.embeddings_T[0][vh_c];
-
-        auto lift = [&] (const Vec3d& _p, const int _idx)
-        {
-            return lift_vertex_to_surface(_p, _map_state.meshes_input[_idx],
-                _map_state.meshes_embeddings_input[_idx], _map_state.bsp_embeddings_input[_idx]);
-        };
-
-        const Vec3d a_lifted_A = lift(a_sphere, mesh_A_idx);
-        const Vec3d b_lifted_A = lift(b_sphere, mesh_A_idx);
-        const Vec3d c_lifted_A = lift(c_sphere, mesh_A_idx);
-        const Vec3d a_lifted_B = lift(a_sphere, mesh_B_idx);
-        const Vec3d b_lifted_B = lift(b_sphere, mesh_B_idx);
-        const Vec3d c_lifted_B = lift(c_sphere, mesh_B_idx);
-
-        Eigen::Vector2d a_local_A, b_local_A, c_local_A, a_local_B, b_local_B, c_local_B;
-        to_local_coordinates(a_lifted_A, b_lifted_A, c_lifted_A, a_local_A, b_local_A, c_local_A);
-        to_local_coordinates(a_lifted_B, b_lifted_B, c_lifted_B, a_local_B, b_local_B, c_local_B);
-
-        Eigen::Matrix2d M_A;
-        M_A << b_local_A - a_local_A, c_local_A - a_local_A;
-        Eigen::Matrix2d M_B;
-        M_B << b_local_B - a_local_B, c_local_B - a_local_B;
-
-        if (M_A.determinant() <= 0 || M_B.determinant() <= 0)
-            continue;
-
-        const Eigen::Matrix2d J_actual = M_B * M_A.inverse();
-
-        // Metric form of the prescription: only V and sigma, U is irrelevant
-        Eigen::Matrix2d V_local;
-        Eigen::Vector2d sigma;
-        lookup_prescribed_metric(a_sphere, b_sphere, c_sphere,
-                                 a_lifted_A, b_lifted_A, c_lifted_A,
-                                 0, _map_state, V_local, sigma);
-
-        if (sigma.minCoeff() <= 1e-6)
-            continue;
-
-        // U drops out of singular values, so J * V * Sigma^-1 has the same spectrum
-        // as the full residual J * J*^{-1}.
-        const Eigen::Matrix2d residual =
-                J_actual * V_local * Eigen::Vector2d(1.0 / sigma[0], 1.0 / sigma[1]).asDiagonal();
-        const Eigen::Vector2d s = Eigen::JacobiSVD<Eigen::Matrix2d>(residual).singularValues();
-
-        // Both determinants are > 0 and sigma is bounded away from 0 (checked above), so
-        // the residual is nonsingular; the clamp only guards against roundoff in the log.
-        const double s0 = s[0];
-        const double s1 = std::max(s[1], 1e-12);
-
-        // det(M_A) = 2 * area of the lifted A triangle, i.e. the amount of mesh-A
-        // material this T face is responsible for.
-        const double area_A = 0.5 * M_A.determinant();
-
-        devs.emplace_back((std::abs(s0 - 1.0) + std::abs(s1 - 1.0)) / 2.0, area_A);
-        total_area += area_A;
-
-        _stats.max = std::max(_stats.max, std::max(std::abs(s0 - 1.0), std::abs(s1 - 1.0)));
-        _stats.area_part_aw  += area_A * std::abs(std::log(s0 * s1));
-        _stats.shape_part_aw += area_A * std::abs(std::log(s0 / s1));
-    }
-
-    if (devs.empty())
-        return;
-
-    const int n = (int)devs.size();
-    _stats.n_faces = n;
-
-    for (const auto& vw : devs)
-    {
-        _stats.mean += vw.first;
-        _stats.mean_aw += vw.second * vw.first;
-        if (vw.first > 0.1)
-        {
-            _stats.frac_gt_0p1 += 1.0;
-            _stats.frac_gt_0p1_aw += vw.second;
-        }
-    }
-    _stats.mean /= (double)n;
-    _stats.frac_gt_0p1 /= (double)n;
-
-    if (total_area > 0.0)
-    {
-        _stats.mean_aw /= total_area;
-        _stats.frac_gt_0p1_aw /= total_area;
-        _stats.area_part_aw /= total_area;
-        _stats.shape_part_aw /= total_area;
-    }
-
-    std::sort(devs.begin(), devs.end()); // by deviation
-    _stats.median = devs[n / 2].first;
-    _stats.p90 = devs[std::min(n - 1, (int)(0.9 * n))].first;
-    _stats.median_aw = weighted_percentile(devs, total_area, 0.5);
-}
+// ResidualStats / weighted_percentile / compute_metric_residual now live in
+// AdaptiveTriangulations/PrescribedResidual.hh. They were a private copy here and
+// drifted out of sync with the energy they mirror -- see the note in that header.
 
 /// Report both metrics at a pipeline checkpoint, and append a row to the CSV.
 /// Measuring at every stage shows exactly WHERE the map drifts off ground truth.
@@ -520,10 +452,10 @@ void run_config(
     fs::create_directories(output_dir);
 
     // A on A maps the mesh to itself: both inputs are the same file.
-    const fs::path mesh_path_A = DATA_PATH / "meshes/l_shape/newL.obj";
+    const fs::path mesh_path_A = DATA_PATH / MESH_DIR / MESH_A;
     const fs::path mesh_path_B = (_config.pair_mode == PairMode::SelfMap)
             ? mesh_path_A
-            : DATA_PATH / "meshes/l_shape/stretchedL.obj";
+            : DATA_PATH / MESH_DIR / MESH_B;
 
     // --- Landmarks -------------------------------------------------------
     // Written into the OUTPUT dir (never into DATA_PATH). The two meshes share
@@ -577,6 +509,24 @@ void run_config(
         fs::copy_file(shared_cache, embedding_path_A, fs::copy_options::overwrite_existing);
         fs::copy_file(shared_cache, embedding_path_B, fs::copy_options::overwrite_existing);
         ISM_INFO("Using shared sphere embedding (initial map = ground truth)");
+    }
+
+    // Mobius-fitted embedding for B. Mutually exclusive with share_embedding: that path
+    // deliberately makes both embeddings equal, which this would break.
+    if (MOBIUS_FITTED_EMBEDDING_B && !share_embedding
+        && _config.pair_mode == PairMode::Stretched)
+    {
+        const fs::path fitted = OUTPUT_PATH
+                / ("mobius_probe_" + fs::path(MESH_DIR).filename().string())
+                / "embedding_B_mobius_fitted.obj";
+        ISM_ASSERT(fs::exists(fitted)); // run `mobius_probe <dir> <A> <B> <fps>` first
+        // A's embedding must still be the ORIGINAL one: the fit was computed against it.
+        const fs::path src_A = _output_root
+                / ("AonB_prescribed_fps" + std::to_string(N_FPS_LANDMARKS)) / "embedding_A.obj";
+        ISM_ASSERT(fs::exists(src_A));
+        fs::copy_file(src_A, embedding_path_A, fs::copy_options::overwrite_existing);
+        fs::copy_file(fitted, embedding_path_B, fs::copy_options::overwrite_existing);
+        ISM_INFO("Using the Mobius-fitted embedding for mesh B");
     }
 
     if (_config.pair_mode == PairMode::SelfMap)
@@ -651,6 +601,7 @@ void run_config(
         AdaptiveTriangulationsSettings settings = coarse_phase_settings();
         settings.use_prescribed_jacobian = prescribed && PRESCRIBED_IN_COARSE_PHASE;
         settings.prescribed_metric_form = true;
+        settings.prescribed_mesh_ideal = PRESCRIBED_MESH_IDEAL;
         settings.w_map = W_MAP;
         settings.w_mesh = W_MESH;
         optimize_with_remeshing(map_state, settings, "",
@@ -662,6 +613,7 @@ void run_config(
         AdaptiveTriangulationsSettings settings = fine_phase_settings();
         settings.use_prescribed_jacobian = prescribed;
         settings.prescribed_metric_form = true; // metric form, not the legacy full-J* residual
+        settings.prescribed_mesh_ideal = PRESCRIBED_MESH_IDEAL;
         settings.w_map = W_MAP;
         settings.w_mesh = W_MESH;
         settings.max_iterations = 50;
@@ -687,17 +639,28 @@ void run_config(
 
 void run()
 {
-    const fs::path output_root = OUTPUT_PATH / "baseline_comparison";
+    // The mesh pair MUST be part of the output path. Sphere embeddings are cached under
+    // output_root (embedding_shared.obj, and embedding_A/B.obj per config) and loaded
+    // whenever present, so a shared root would silently feed one pair's embedding to the
+    // other -- the same stale-cache trap that once turned START_FROM_GROUND_TRUTH into a
+    // no-op and produced a plausible-looking but meaningless run.
+    const fs::path output_root =
+            OUTPUT_PATH / ("baseline_comparison_" + fs::path(MESH_DIR).filename().string());
+    fs::create_directories(output_root);
+
+#if ISM_HAS_VIEWER
     const fs::path screenshot_dir = output_root / "screenshots";
     fs::create_directories(screenshot_dir);
-
     glow::SharedTexture2D texture = read_texture(DATA_PATH / "textures/checkerboard.png");
+#endif
 
     // CSV of all metrics, one row per (config, stage)
     const std::string suffix = "fps" + std::to_string(N_FPS_LANDMARKS)
             + std::string(START_FROM_GROUND_TRUTH ? "_gt" : "")
             + std::string(PRESCRIBED_IN_COARSE_PHASE ? "_pcoarse" : "")
-            + weight_tag("wmap", W_MAP) + weight_tag("wmesh", W_MESH);
+            + weight_tag("wmap", W_MAP) + weight_tag("wmesh", W_MESH)
+            + std::string(PRESCRIBED_MESH_IDEAL ? "_pmesh" : "")
+            + std::string(MOBIUS_FITTED_EMBEDDING_B ? "_mob" : "");
     std::ofstream csv(output_root / ("metrics_" + suffix + ".csv"));
     csv << "config,stage,corr_mean,corr_median,corr_max,"
            "residual_mean,residual_mean_aw,residual_median,residual_median_aw,"
@@ -720,6 +683,14 @@ void run()
     csv.close();
     ISM_INFO("Wrote metrics_" << suffix << ".csv");
 
+#if !ISM_HAS_VIEWER
+    // Headless build (e.g. Apple Silicon): macOS caps desktop OpenGL at 4.1 and glow
+    // needs 4.2-4.5, so there is no viewer here. The CSVs, the per-config trace and the
+    // lifted-T OBJs are all written exactly as above; only the 8 renders are missing.
+    // To inspect a per-face field without a window, colour it with linear_colors() and
+    // write it with write_colored_ply_flat().
+    ISM_INFO("Headless build: skipping the 8 renders. CSV, trace and OBJs are written.");
+#else
     // --- Visualization: 2 per config = 8 total ---------------------------
     // Row 1: geometry + wireframe on B (does T look sane, do triangles slide?)
     // Row 2: checkerboard transferred A -> B (sliding and shear are obvious here)
@@ -760,6 +731,8 @@ void run()
         }
     }
 
+#endif // ISM_HAS_VIEWER
+
     ISM_INFO("Done.");
 }
 
@@ -767,7 +740,9 @@ void run()
 
 int main()
 {
+#if ISM_HAS_VIEWER
     glow::glfw::GlfwContext ctx;
+#endif
     using namespace SurfaceMaps;
     init_lib_surface_maps();
     run();

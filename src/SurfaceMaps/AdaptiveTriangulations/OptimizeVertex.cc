@@ -80,8 +80,22 @@ double eval_triangles(
             // Evaluate energy
             for (int i = 0; i < (int)_map_state.meshes_input.size(); i++)
             {
+                // MUST match the ideal used by the Newton element in OptimizeMap.cc.
+                // This path is what split/collapse/flip use to decide whether an
+                // operation improves the energy; if the two disagreed, remeshing would be
+                // judging a different energy than the one being minimized.
+                Eigen::Matrix2d ideal_shape = Eigen::Matrix2d::Identity();
+                const int presc_pair = prescribed_pair_for_B_mesh(_map_state, _settings, i);
+                if (presc_pair >= 0)
+                {
+                    const int mA = _map_state.pairs_map_distortion[presc_pair].first;
+                    ideal_shape = prescribed_ideal_shape(
+                                _tris[mA][tri_idx].a_sphere, _tris[mA][tri_idx].b_sphere,
+                                _tris[mA][tri_idx].c_sphere, presc_pair, _map_state);
+                }
+
                 E += eval_mesh_energy_triangle_T(_tris[i][tri_idx].a_sphere, _tris[i][tri_idx].b_sphere, _tris[i][tri_idx].c_sphere,
-                                                 i, min_tel, _map_state, _settings);
+                                                 i, min_tel, _map_state, _settings, ideal_shape);
                 if (E == INFINITY)
                     return INFINITY;
             }

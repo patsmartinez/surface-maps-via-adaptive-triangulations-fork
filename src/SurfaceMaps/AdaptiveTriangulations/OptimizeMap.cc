@@ -19,7 +19,9 @@
 
 #include <SurfaceMaps/AdaptiveTriangulations/Helpers.hh>
 #include <SurfaceMaps/AdaptiveTriangulations/LiftToSurface.hh>
-#include <SurfaceMaps/AdaptiveTriangulations/Visualization.hh>
+#if ISM_HAS_VIEWER
+#include <SurfaceMaps/AdaptiveTriangulations/Visualization.hh> // unused here, kept for the viewer build
+#endif
 #include <SurfaceMaps/AdaptiveTriangulations/OptimizeMapEnergies.hh>
 #include <SurfaceMaps/AdaptiveTriangulations/AssignVerticesToFaces.hh>
 #include <SurfaceMaps/AdaptiveTriangulations/AdaptiveTargetEdgeLength.hh>
@@ -256,11 +258,31 @@ OptimizeMapStatus optimize_map(
                         _map_state.meshes_input[mesh_tel_idx], _map_state.meshes_embeddings_input[mesh_tel_idx],
                         _map_state.tels_input[mesh_tel_idx], _map_state.bsp_embeddings_input[mesh_tel_idx]);
 
+            // Prescription-aware ideal: fetch mesh A's sphere positions for this T
+            // triangle PASSIVELY -- exactly as the tel search above does -- and turn the
+            // prescribed metric into a shape matrix for the ideal triangle.
+            //
+            // Passive on purpose. The ideal is a TARGET, not a map degree of freedom, so
+            // it should not add Hessian coupling to mesh A's variables; the prescription
+            // itself is enforced actively by the trianglepair term. variables_passive
+            // still sees the current line-search trial, so the target stays consistent
+            // with the iterate being evaluated.
+            Eigen::Matrix2d ideal_shape = Eigen::Matrix2d::Identity();
+            const int presc_pair = prescribed_pair_for_B_mesh(_map_state, _settings, mesh_idx);
+            if (presc_pair >= 0)
+            {
+                const int mA = _map_state.pairs_map_distortion[presc_pair].first;
+                const Eigen::Vector3d a_sph_A = retract(element.variables_passive(v_a.idx() + (mA * num_verts)), v_a, mA);
+                const Eigen::Vector3d b_sph_A = retract(element.variables_passive(v_b.idx() + (mA * num_verts)), v_b, mA);
+                const Eigen::Vector3d c_sph_A = retract(element.variables_passive(v_c.idx() + (mA * num_verts)), v_c, mA);
+                ideal_shape = prescribed_ideal_shape(a_sph_A, b_sph_A, c_sph_A, presc_pair, _map_state);
+            }
+
             return eval_mesh_energy_triangle_T(
                         a_mani_A, b_mani_A, c_mani_A,
                         mesh_idx, tel,
                         _map_state,
-                        _settings);
+                        _settings, ideal_shape);
         });
     }
 

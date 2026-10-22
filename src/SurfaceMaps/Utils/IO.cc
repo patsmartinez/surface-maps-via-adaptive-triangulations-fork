@@ -9,8 +9,9 @@
 
 #include "IO.hh"
 
-#include <polymesh/Mesh.hh>
-#include <glow/objects/Texture2D.hh>
+// NOTE: the polymesh / glow / typed-geometry dependent definitions from this file
+// live in IO_Graphics.cc, so that this translation unit (which every app pulls in
+// via IO.hh) builds without a graphics stack. See apple-silicon headless target.
 #include <OpenMesh/Core/IO/MeshIO.hh>
 #include <SurfaceMaps/Utils/Helpers.hh>
 #include <SurfaceMaps/Utils/BarycentricPoint.hh>
@@ -205,6 +206,90 @@ TexCoords tex_coords(
     }));
 }
 
+void write_colored_ply(
+        const TriMesh& _mesh,
+        const ExternalProperty<FH, Color>& _face_colors,
+        const fs::path& _path)
+{
+    // Average the adjacent face colors into each vertex
+    std::vector<Color> vertex_colors(_mesh.n_vertices(), Color(0, 0, 0, 0));
+    std::vector<int> vertex_counts(_mesh.n_vertices(), 0);
+    for (auto fh : _mesh.faces())
+    {
+        for (auto vh : fh.vertices())
+        {
+            vertex_colors[vh.idx()] += _face_colors[fh];
+            vertex_counts[vh.idx()]++;
+        }
+    }
+    for (size_t i = 0; i < vertex_colors.size(); ++i)
+    {
+        if (vertex_counts[i] > 0)
+            vertex_colors[i] /= (float)vertex_counts[i];
+    }
+
+    make_file_directory(_path);
+    std::ofstream file(_path);
+    file << "ply\nformat ascii 1.0\n";
+    file << "element vertex " << _mesh.n_vertices() << "\n";
+    file << "property float x\nproperty float y\nproperty float z\n";
+    file << "property uchar red\nproperty uchar green\nproperty uchar blue\n";
+    file << "element face " << _mesh.n_faces() << "\n";
+    file << "property list uchar int vertex_indices\n";
+    file << "end_header\n";
+
+    for (auto vh : _mesh.vertices())
+    {
+        const auto p = _mesh.point(vh);
+        const Color c = vertex_colors[vh.idx()];
+        file << p[0] << " " << p[1] << " " << p[2] << " "
+             << (int)(c[0] * 255) << " " << (int)(c[1] * 255) << " " << (int)(c[2] * 255) << "\n";
+    }
+    for (auto fh : _mesh.faces())
+    {
+        file << "3";
+        for (auto vh : fh.vertices())
+            file << " " << vh.idx();
+        file << "\n";
+    }
+
+    ISM_INFO("Wrote " << _path);
+}
+
+void write_colored_ply_flat(
+        const TriMesh& _mesh,
+        const ExternalProperty<FH, Color>& _face_colors,
+        const fs::path& _path)
+{
+    make_file_directory(_path);
+    std::ofstream file(_path);
+    file << "ply\nformat ascii 1.0\n";
+    file << "element vertex " << _mesh.n_faces() * 3 << "\n";
+    file << "property float x\nproperty float y\nproperty float z\n";
+    file << "property uchar red\nproperty uchar green\nproperty uchar blue\n";
+    file << "element face " << _mesh.n_faces() << "\n";
+    file << "property list uchar int vertex_indices\n";
+    file << "end_header\n";
+
+    for (auto fh : _mesh.faces())
+    {
+        const Color c = _face_colors[fh];
+        const int r = (int)(c[0] * 255);
+        const int g = (int)(c[1] * 255);
+        const int b = (int)(c[2] * 255);
+        for (auto vh : fh.vertices())
+        {
+            const auto p = _mesh.point(vh);
+            file << p[0] << " " << p[1] << " " << p[2] << " "
+                 << r << " " << g << " " << b << "\n";
+        }
+    }
+    for (size_t i = 0; i < _mesh.n_faces(); ++i)
+        file << "3 " << 3 * i << " " << 3 * i + 1 << " " << 3 * i + 2 << "\n";
+
+    ISM_INFO("Wrote " << _path);
+}
+
 namespace
 {
 
@@ -254,29 +339,6 @@ void write_element_handles(
         file << std::to_string(h.idx()) << std::endl;
 
     ISM_INFO("Wrote " << _path);
-}
-
-template <typename OM_Handle, typename PM_Handle>
-std::vector<OM_Handle> openmesh_handles(
-        const std::vector<PM_Handle>& _pm)
-{
-    std::vector<OM_Handle> om;
-    for (const auto& h : _pm)
-        om.push_back(OM_Handle(h.idx.value));
-
-    return om;
-}
-
-template <typename PM_Handle, typename OM_Handle>
-std::vector<PM_Handle> polymesh_handles(
-        const std::vector<OM_Handle>& _om,
-        const pm::Mesh& _mesh)
-{
-    std::vector<PM_Handle> pm;
-    for (const auto& h : _om)
-        pm.push_back(_mesh.handle_of(typename PM_Handle::index_t(h.idx())));
-
-    return pm;
 }
 
 }
@@ -451,34 +513,12 @@ std::vector<EH> read_paths(
     return read_element_handles<EH>(_path, _throw_if_not_exist);
 }
 
-std::vector<pm::edge_handle> read_paths(
-        const std::string& _path,
-        const pm::Mesh& _mesh,
-        const bool _throw_if_not_exist)
-{
-    return polymesh_handles<pm::edge_handle>(read_paths(_path, _throw_if_not_exist), _mesh);
-}
-
 void write_paths(
         const std::vector<EH>& _edges,
         const std::string& _path,
         const bool _overwrite)
 {
     write_element_handles(_edges, _path, _overwrite);
-}
-
-void write_paths(
-        const std::vector<pm::edge_handle>& _edges,
-        const std::string& _path,
-        const bool _overwrite)
-{
-    write_element_handles(openmesh_handles<EH>(_edges), _path, _overwrite);
-}
-
-glow::SharedTexture2D read_texture(
-        const fs::path &_file_path)
-{
-    return glow::Texture2D::createFromFile(_file_path, glow::ColorSpace::sRGB);
 }
 
 ExternalProperty<VH, Vec3d> embedding_from_mesh(
@@ -591,50 +631,6 @@ Parametrization param_from_matrix(
         param[vh] = Vec2d(_P(vh.idx(), 0), _P(vh.idx(), 1));
 
     return param;
-}
-
-pm::vertex_attribute<Vec3d> to_polymesh(
-        const TriMesh& mesh,
-        pm::Mesh& m)
-{
-    for (auto vh : mesh.vertices())
-        m.vertices().add();
-    for (auto fh : mesh.faces())
-    {
-        VH vh_a, vh_b, vh_c;
-        handles(mesh, fh, vh_a, vh_b, vh_c);
-        m.faces().add(m.handle_of(pm::vertex_index(vh_b.idx())),
-                      m.handle_of(pm::vertex_index(vh_c.idx())),
-                      m.handle_of(pm::vertex_index(vh_a.idx())));
-    }
-
-    auto pos = m.vertices().make_attribute<Vec3d>();
-    for (auto vh : mesh.vertices())
-        pos[m.handle_of(pm::vertex_index(vh.idx()))] = mesh.point(vh);
-
-    return pos;
-}
-
-pm::vertex_attribute<tg::pos3> to_polymesh_tg(
-        const TriMesh& mesh,
-        pm::Mesh& m)
-{
-    for (auto vh : mesh.vertices())
-        m.vertices().add();
-    for (auto fh : mesh.faces())
-    {
-        VH vh_a, vh_b, vh_c;
-        handles(mesh, fh, vh_a, vh_b, vh_c);
-        m.faces().add(m.handle_of(pm::vertex_index(vh_b.idx())),
-                      m.handle_of(pm::vertex_index(vh_c.idx())),
-                      m.handle_of(pm::vertex_index(vh_a.idx())));
-    }
-
-    auto pos = m.vertices().make_attribute<tg::pos3>();
-    for (auto vh : mesh.vertices())
-        pos[m.handle_of(pm::vertex_index(vh.idx()))] = tg::pos3(mesh.point(vh));
-
-    return pos;
 }
 
 MatXd uv_vector_to_matrix(

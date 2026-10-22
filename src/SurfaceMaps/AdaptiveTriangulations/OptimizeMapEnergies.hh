@@ -102,7 +102,30 @@ T eval_trianglepair_energy_triangle_T(
         const MapState& _map_state,
         const AdaptiveTriangulationsSettings& _settings);
 
-/// Evaluate mesh energy for triangle of T for MapState
+/// Index of the prescribed pair whose B side is _mesh_idx, or -1 if this mesh is not the
+/// B side of one (or the prescription-aware mesh ideal is off). Callers need it before
+/// prescribed_ideal_shape, to know which mesh's sphere positions to fetch.
+int prescribed_pair_for_B_mesh(
+        const MapState& _map_state,
+        const AdaptiveTriangulationsSettings& _settings,
+        const int _mesh_idx);
+
+/// The 2x2 shape matrix E_mesh should apply to the ideal triangle on the B side of
+/// _pair_idx. SPD with det == 1: it carries the prescribed ANISOTROPY and leaves the AREA
+/// to the sizing field. Identity if the lookup degenerates.
+///
+/// Takes the A-side sphere positions of the T triangle, because the prescribed field is
+/// indexed by faces of mesh A and the returned matrix lives in that triangle's local
+/// frame on A.
+Eigen::Matrix2d prescribed_ideal_shape(
+        const Vec3d& _a_sphere_A,
+        const Vec3d& _b_sphere_A,
+        const Vec3d& _c_sphere_A,
+        const int _pair_idx,
+        const MapState& _map_state);
+
+/// Evaluate mesh energy for triangle of T for MapState.
+/// _ideal_shape deforms the ideal triangle; identity gives the original equilateral.
 template <typename T>
 T eval_mesh_energy_triangle_T(
         const Vec3<T>& _a_sphere,
@@ -111,7 +134,8 @@ T eval_mesh_energy_triangle_T(
         const int& _mesh_idx,
         const T& _tel,
         const MapState& _map_state,
-        const AdaptiveTriangulationsSettings& _settings);
+        const AdaptiveTriangulationsSettings& _settings,
+        const Eigen::Matrix2d& _ideal_shape = Eigen::Matrix2d::Identity());
 
 /// Evaluate energy for a landmark vertex of mesh T with two embeddings
 template <typename T>

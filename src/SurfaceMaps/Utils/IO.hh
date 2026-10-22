@@ -103,6 +103,21 @@ void write_mesh(
 TexCoords tex_coords(
         const TriMesh& _mesh);
 
+/// Write a PLY with per-vertex colors, averaging the colors of the adjacent faces.
+/// Lets a per-face scalar field be inspected in any mesh viewer, with no OpenGL
+/// context -- the only way to look at a field when running headless.
+void write_colored_ply(
+        const TriMesh& _mesh,
+        const ExternalProperty<FH, Color>& _face_colors,
+        const fs::path& _path);
+
+/// Same, but splits every face into its own three vertices so the colors stay flat
+/// instead of being smoothed across edges. Prefer this for per-face quantities.
+void write_colored_ply_flat(
+        const TriMesh& _mesh,
+        const ExternalProperty<FH, Color>& _face_colors,
+        const fs::path& _path);
+
 enum class LandmarkFormat
 {
     Pinned,  // Default: A list of vertex indices

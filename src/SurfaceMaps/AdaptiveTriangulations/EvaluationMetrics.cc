@@ -260,7 +260,9 @@ void metric_mapping_distortion(const TriMesh& _mesh_1,
             min_distortion = 1.0;
             max_distortion = 1.0;
         }
-        if (iszero(min_distortion)){
+        // iszero() is a glibc/C11-TS extension that Apple's libm does not provide.
+        // For a finite double this is exactly equivalent (true for both +0 and -0).
+        if (min_distortion == 0.0){
             ISM_WARNING("min distortion zero!");
             min_distortion = 1.0;
             max_distortion = 1.0;
