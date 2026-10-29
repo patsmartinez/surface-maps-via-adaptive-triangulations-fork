@@ -60,6 +60,7 @@
 #include <Eigen/SVD>
 #include <TinyAD/Utils/Timer.hh>
 #include <fstream>
+#include <cstdlib>
 
 namespace SurfaceMaps
 {
@@ -219,6 +220,20 @@ const bool PRESCRIBED_MESH_IDEAL = false;
 /// SelfMap must keep both embeddings identical, and START_FROM_GROUND_TRUTH overrides it.
 const bool MOBIUS_FITTED_EMBEDDING_B = false;
 
+/// Treat E_mesh's target edge length as the passive SIZING FIELD it is, instead of
+/// re-computing it as a differentiable function of the map. See
+/// AdaptiveTriangulationsSettings::mesh_tel_passive for the mechanism; in short, the
+/// active re-computation makes tel a map DOF with d/d(tel) ~ -2 l^2/tel^3 against a
+/// sizing floor of 1e-3, so E_mesh contributes ~1e9 of gradient where E_map contributes
+/// ~1.6, and the strict `<` tie-break routes all of it onto mesh 0.
+///
+/// It is in the OUTPUT TAG because it is not a tuning knob: every CSV without
+/// `_telpassive` in its name was produced with the bug live, and the two are not
+/// comparable. On the U self-map at W_MESH = 0.01 it takes corr_mean from 1.37e-2 to
+/// 1.60e-8 -- the "self-map floor" that the first column of every error budget was
+/// normalized against was this bug, not a resolution limit.
+const bool MESH_TEL_PASSIVE = true;
+
 /// Per-iteration trace, via the optimizer's own two callbacks (nothing in the algorithm
 /// changes). _callback_for_optim fires once per Newton iteration, inside the loop, after
 /// embeddings_T and the local bases are updated (OptimizeMap.cc "after_optimization");
@@ -226,11 +241,110 @@ const bool MOBIUS_FITTED_EMBEDDING_B = false;
 /// "after_splits" / "after_collapses" / "after_flips"). Because they are separate, a
 /// change can be attributed to a continuous step or to one specific remeshing operation.
 ///
-/// Its question is answered: the residual jumps at after_splits and never at Newton
-/// steps, while corr stays flat across those same splits -- so refinement sharpens the
-/// MEASUREMENT rather than degrading the map, and "the fine phase degrades the residual"
-/// was wrong. Kept because nothing else can attribute a change to an operation, but OFF
-/// by default: it lifts all 786 input vertices every frame and roughly doubles runtime.
+/// It also records embedding_drift and min_angle_stats, which turn the self-map floor
+/// into something directly attributable -- see those two helpers.
+///
+/// ANSWERED TWICE.
+///
+/// (1) Refinement sharpens the MEASUREMENT, it does not degrade the map: the residual
+///     jumps at after_splits while corr stays flat across those same splits. Confirmed
+///     independently by drift, which is resolution-free and does NOT rise at splits.
+///
+/// (2) 2026-10-25, U self-map, W_MESH 0.01 and 1.0. The floor is made by the CONTINUOUS
+///     optimizer, not by remeshing and not by triangle quality:
+///                                        W_MESH 1.0      W_MESH 0.01
+///       corr increase from Newton steps     95.2%           95.6%
+///       drift_max increase from Newton     100.0%          100.0%
+///       net drift from after_collapses     +0.04 deg       -0.33 deg  (healing)
+///       net drift from after_flips          0.00 deg        0.00 deg  (exactly zero)
+///       final mean min-angle               30.98 deg       27.48 deg  (-11%)
+///       final mean drift                    0.37 deg        1.63 deg  (4.5x)
+///     Quality barely moves while drift grows 4.5x, so the two are uncorrelated and a
+///     smoothing operator cannot be the fix. Frames 0-3 are the sharp bit: splits and
+///     collapses take T from 30 to 47 to 40 vertices with drift at EXACTLY 0 and corr at
+///     6e-17, then the first Newton step alone puts drift at 2.57 deg and corr at
+///     0.0018. See embedding_drift for why that step should be impossible.
+///
+/// OFF by default: it lifts all input vertices every frame and roughly doubles runtime.
+/// Run only the two A-on-A configs and skip A-on-B. For the floor diagnostic the
+/// self-map is the whole question and A-on-B just doubles the runtime; on the U that
+/// matters. (And on a self-map J* = I, so the dirichlet and prescribed rows are the
+/// same computation -- one of the two is enough.)
+const bool SELF_MAP_ONLY      = false;
+
+/// Log the A<->B antisymmetric part of the gradient and the Newton direction once per
+/// iteration (see AdaptiveTriangulationsSettings::probe_symmetry). Pair with
+/// SELF_MAP_ONLY -- it is only meaningful on a self-map.
+const bool PROBE_SYMMETRY     = false;
+
+/// Mirror of SELF_MAP_ONLY: run only the two A-on-B configs and skip A-on-A.
+///
+/// For the GT-START ablation the self-map rows are pure overhead -- SelfMap always
+/// shares its embedding, so START_FROM_GROUND_TRUTH does not change them and they
+/// duplicate the plain run's A-on-A rows exactly. Since the tel fix put them at
+/// 1e-11 they carry no information either. On a 52k-vertex input that is half the
+/// runtime for nothing.
+const bool STRETCHED_ONLY     = false;
+
+/// Multiply the coarse AND fine phases' target approximation error (0.01 / 0.001) by
+/// this factor, which is the ONLY clean way to move T's resolution while holding the
+/// input mesh, its geometry and the prescribed field J* exactly fixed.
+///
+/// tel ~ sqrt(6 * approx_error / curvature), so |F(T)| ~ 1/approx_error: 0.25 gives
+/// roughly 4x the faces, 4.0 roughly a quarter.
+///
+/// This exists to test one claim: that the prescribed energy's advantage over symmetric
+/// Dirichlet is set by how finely T samples J*, not by the shape. Measured at
+/// |F(T)|/|F(input)|, that advantage runs U 0.22 -> 0.99x, L 0.64 -> 9.88x,
+/// sphere 5.79 -> 32x, monotone at two weight settings independently. But the three
+/// shapes differ in more than that ratio, so the correlation does not establish cause.
+/// Scaling T on ONE shape does: refine the U toward the L's ratio and the advantage
+/// should appear; coarsen the L toward the U's and it should vanish.
+///
+/// NOT testable by subdividing the input. A linear subdivision whose displaced mesh is
+/// the piecewise-linear interpolant of the original (verified: agrees to 1.2e-6) leaves
+/// J* unchanged -- every child triangle inherits its parent's Jacobian -- so it adds
+/// redundant samples of the same field rather than a finer field. It also hands every
+/// face-interior vertex zero discrete curvature, which corrupts the sizing field and
+/// made T COARSER (2606 -> 920 faces), moving the ratio by the wrong mechanism.
+const double APPROX_ERROR_SCALE = 1.0;
+
+/// THE GT LOOKUP MEASUREMENT. Remesh T but never take a Newton step
+/// (AdaptiveTriangulationsSettings::remesh_only), so paired with
+/// START_FROM_GROUND_TRUTH the map stays EXACTLY at the ground truth while T is refined
+/// to whatever APPROX_ERROR_SCALE asks for.
+///
+/// Why that is the measurement we want: the residual metric compares the ACHIEVED
+/// Jacobian of each T triangle against the J* the energy looks up for it. When the map
+/// is the ground truth the achieved Jacobian IS the true one, so the residual stops
+/// being map error and becomes exactly "how wrong is the looked-up J* on this triangle".
+/// The lookup is a single point sample -- the input face of A's embedding containing the
+/// T triangle's CENTROID -- so this measures the error of representing a field that
+/// varies across the triangle by one sample at its middle, plus the error of projecting
+/// that face's V frame into the T triangle's own basis.
+///
+/// corr_mean must stay at ~1e-17 in every stage of such a run. That is the built-in
+/// proof that the map did not move and the number means what it claims.
+const bool REMESH_ONLY = false;
+
+/// Cap on the sizing field, overriding the phases' default of 100.0 -- i.e. no cap at
+/// all, on a mesh normalized to surface area 1.
+///
+/// The knob APPROX_ERROR_SCALE cannot reach. tel = sqrt(6*e/kappa - 3*e^2) CLAMPED to
+/// [min_edge_length, max_edge_length]; on a flat region kappa -> 0 sends tel to infinity
+/// and the clamp pins it at max_edge_length whatever e is. So scaling the approximation
+/// error refines T only where it is already curved and leaves flat regions exactly as
+/// coarse -- and on the U that is precisely where the J* lookup error lives.
+///
+/// Measured by lookup_distortion_probe at the frozen ground truth, U, approx scale 1:
+///   max_el 100 -> |F(T)| 1996, lookup error 0.0473, 17.2% of area off by >10%
+///   max_el 0.3 -> |F(T)| 3324, lookup error 0.00446
+///   max_el 0.1 -> |F(T)| 3534, lookup error 0.00269
+///   max_el 0.03-> |F(T)| 4628, lookup error 0.00120
+/// 39x less lookup error for 2.3x the faces. The L barely moves (0.0035 -> 0.0046), so
+/// the mechanism is specific to shapes with large flat regions.
+const double MAX_EDGE_LENGTH = 100.0;
+
 const bool TRACE_ITERATIONS   = false;
 const bool TRACE_WRITE_MESHES = false;
 /// Dump a mesh only every Nth traced step (the CSV always gets every step).
@@ -300,6 +414,10 @@ struct Config
         return pair + "_" + energy + "_" + lm + gt
              + weight_tag("wmap", W_MAP) + weight_tag("wmesh", W_MESH)
              + (PRESCRIBED_MESH_IDEAL ? "_pmesh" : "")
+             + (MESH_TEL_PASSIVE ? "_telpassive" : "")
+             + weight_tag("approx", APPROX_ERROR_SCALE)
+             + (REMESH_ONLY ? "_frozen" : "")
+             + weight_tag("mel", MAX_EDGE_LENGTH / 100.0)
              + ((pair_mode == PairMode::Stretched && MOBIUS_FITTED_EMBEDDING_B
                  && !START_FROM_GROUND_TRUTH) ? "_mob" : "");
     }
@@ -357,6 +475,84 @@ void compute_correspondence_error(
 
 /// Report both metrics at a pipeline checkpoint, and append a row to the CSV.
 /// Measuring at every stage shows exactly WHERE the map drifts off ground truth.
+/// Angular distance, in degrees, between the two sphere positions T's vertices carry.
+///
+/// For the SELF-MAP configs this IS the floor, read straight off the degrees of freedom.
+/// Both embeddings start bit-identical, and identical positions mean the identity map at
+/// ANY resolution of T -- the map is the PAIR, so a coarse T represents the identity
+/// exactly. So every bit of self-map corr_mean and residual is the two embeddings having
+/// drifted apart, and nothing else. Measuring that directly removes the lifting, the
+/// barycentric interpolation and the per-face SVD from between the cause and the number.
+/// (Verified: the trace's first four frames take T from 30 to 47 to 40 vertices through
+/// splits and collapses with drift at exactly 0 and corr pinned at 6e-17.)
+///
+/// AND THE FIRST NEWTON STEP SHOULD NOT BE ABLE TO MOVE IT. On a self-map the two input
+/// meshes, their embeddings and their lifting are the same object, so
+///     E(x_A, x_B) = q(x_A) + q(x_B) + E_map(x_A, x_B)
+/// with ONE q (E_mesh, E_approx, barrier and regularizer each depend on a single
+/// embedding) and an E_map that is symmetric under swapping its arguments. A symmetric
+/// function has a symmetric gradient and Hessian at a symmetric point, so the Newton
+/// step is symmetric and x_A = x_B is preserved exactly. The trace nonetheless goes
+/// 0 -> 2.57 deg in one iteration, which leaves two possibilities:
+///   (a) something in the assembly treats mesh 0 and mesh 1 differently -- a bug, and
+///       the one worth finding, since it would collapse the floor outright; or
+///   (b) the symmetric configuration is a SADDLE in the antisymmetric directions, and
+///       projected Newton flips those negative eigenvalues positive and takes a large
+///       step along them, amplifying a 1e-16 asymmetry to O(1) in a single iteration.
+/// Distinguishing them needs the antisymmetric part of the gradient at frame 0:
+/// ||g_A - g_B|| / ||g|| at machine epsilon means (b), anything larger means (a).
+void embedding_drift(
+        const MapState& _map_state,
+        double& _mean_deg,
+        double& _max_deg)
+{
+    _mean_deg = 0.0;
+    _max_deg = 0.0;
+    if (_map_state.embeddings_T.size() < 2 || _map_state.mesh_T.n_vertices() == 0)
+        return;
+
+    double sum = 0.0;
+    for (auto vh : _map_state.mesh_T.vertices())
+    {
+        const Vec3d a = _map_state.embeddings_T[0][vh].normalized();
+        const Vec3d b = _map_state.embeddings_T[1][vh].normalized();
+        const double deg = std::acos(std::clamp(a.dot(b), -1.0, 1.0)) * 180.0 / M_PI;
+        sum += deg;
+        _max_deg = std::max(_max_deg, deg);
+    }
+    _mean_deg = sum / (double)_map_state.mesh_T.n_vertices();
+}
+
+/// Smallest interior angle per triangle, in degrees: averaged over faces, and the worst
+/// face. This is the quantity E_mesh is there to protect (its ideal is equilateral, i.e.
+/// 60 deg), so it says whether down-weighting E_mesh actually degrades T's shape or
+/// whether the term is being blamed for something else.
+void min_angle_stats(
+        const TriMesh& _mesh,
+        double& _mean_deg,
+        double& _worst_deg)
+{
+    _mean_deg = 0.0;
+    _worst_deg = 180.0;
+    if (_mesh.n_faces() == 0)
+        return;
+
+    double sum = 0.0;
+    for (auto fh : _mesh.faces())
+    {
+        auto heh0 = fh.halfedge();
+        auto heh1 = heh0.next();
+        auto heh2 = heh1.next();
+        const double a = _mesh.calc_sector_angle(heh0);
+        const double b = _mesh.calc_sector_angle(heh1);
+        const double c = _mesh.calc_sector_angle(heh2);
+        const double m = std::min({a, b, c}) * 180.0 / M_PI;
+        sum += m;
+        _worst_deg = std::min(_worst_deg, m);
+    }
+    _mean_deg = sum / (double)_mesh.n_faces();
+}
+
 void report(
         const MapState& _map_state,
         const std::string& _config_name,
@@ -369,6 +565,14 @@ void report(
     ResidualStats res;
     compute_metric_residual(_map_state, res);
 
+    double drift_mean, drift_max;
+    embedding_drift(_map_state, drift_mean, drift_max);
+
+    const std::vector<TriMesh> lifted_for_quality = lifted_meshes_from_mapstate(_map_state);
+    double ang_mean_A, ang_worst_A, ang_mean_B, ang_worst_B;
+    min_angle_stats(lifted_for_quality[0], ang_mean_A, ang_worst_A);
+    min_angle_stats(lifted_for_quality[1], ang_mean_B, ang_worst_B);
+
     ISM_INFO("[" << _config_name << " | " << _stage << "] "
              << "corr_err mean=" << corr_mean << " median=" << corr_median << " max=" << corr_max
              << " | residual mean=" << res.mean << " (aw " << res.mean_aw << ")"
@@ -376,7 +580,10 @@ void report(
              << " frac>0.1=" << res.frac_gt_0p1
              << " | area=" << res.area_part_aw << " shape=" << res.shape_part_aw
              << " (" << res.n_faces << " faces)"
-             << " | |V(T)|=" << _map_state.mesh_T.n_vertices());
+             << " | |V(T)|=" << _map_state.mesh_T.n_vertices()
+             << " | drift mean=" << drift_mean << " max=" << drift_max << " deg"
+             << " | min-angle A " << ang_mean_A << "/" << ang_worst_A
+             << " B " << ang_mean_B << "/" << ang_worst_B);
 
     _csv << _config_name << "," << _stage << ","
          << corr_mean << "," << corr_median << "," << corr_max << ","
@@ -384,8 +591,40 @@ void report(
          << res.median << "," << res.median_aw << "," << res.p90 << "," << res.max << ","
          << res.frac_gt_0p1 << "," << res.frac_gt_0p1_aw << ","
          << res.area_part_aw << "," << res.shape_part_aw << ","
-         << res.n_faces << "," << _map_state.mesh_T.n_vertices() << "\n";
+         << res.n_faces << "," << _map_state.mesh_T.n_vertices() << ","
+         << drift_mean << "," << drift_max << ","
+         << ang_mean_A << "," << ang_worst_A << ","
+         << ang_mean_B << "," << ang_worst_B << "\n";
     _csv.flush();
+}
+
+/// Diagnostic ONLY, and only reachable from the environment, so a normal run is
+/// untouched: override individual energy weights without a rebuild. Its purpose is to
+/// isolate one term for the symmetry probe -- run with a single weight nonzero and
+/// g_anti_rel names the term that treats mesh 0 and mesh 1 differently.
+void probe_weight_overrides(
+        AdaptiveTriangulationsSettings& _settings)
+{
+    struct { const char* var; double* w; } knobs[] = {
+        { "ISM_W_MAP",     &_settings.w_map     },
+        { "ISM_W_MESH",    &_settings.w_mesh    },
+        { "ISM_W_APPROX",  &_settings.w_approx  },
+        { "ISM_W_BARRIER", &_settings.w_barrier },
+        { "ISM_W_REG",     &_settings.w_reg     },
+    };
+    if (const char* e = std::getenv("ISM_TEL_PASSIVE"))
+    {
+        _settings.mesh_tel_passive = (std::atoi(e) != 0);
+        ISM_HIGHLIGHT("[probe] mesh_tel_passive = " << _settings.mesh_tel_passive);
+    }
+    for (const auto& k : knobs)
+    {
+        if (const char* e = std::getenv(k.var))
+        {
+            *k.w = std::atof(e);
+            ISM_HIGHLIGHT("[probe] " << k.var << " overridden to " << *k.w);
+        }
+    }
 }
 
 /// Zero-padded frame index, so the dumped meshes sort in optimization order.
@@ -413,18 +652,28 @@ void trace_step(
     ResidualStats res;
     compute_metric_residual(_map_state, res);
 
+    double drift_mean, drift_max;
+    embedding_drift(_map_state, drift_mean, drift_max);
+
+    const std::vector<TriMesh> lifted = lifted_meshes_from_mapstate(_map_state);
+    double ang_mean_A, ang_worst_A, ang_mean_B, ang_worst_B;
+    min_angle_stats(lifted[0], ang_mean_A, ang_worst_A);
+    min_angle_stats(lifted[1], ang_mean_B, ang_worst_B);
+
     // Area-weighted only: T changes size constantly here, so the unweighted numbers
     // would not be comparable from one row to the next.
     _csv << _frame << "," << _kind << "," << _label << ","
          << corr_mean << "," << corr_median << ","
          << res.mean_aw << "," << res.area_part_aw << "," << res.shape_part_aw << ","
          << res.frac_gt_0p1_aw << "," << res.n_faces << ","
-         << _map_state.mesh_T.n_vertices() << "\n";
+         << _map_state.mesh_T.n_vertices() << ","
+         << drift_mean << "," << drift_max << ","
+         << ang_mean_A << "," << ang_worst_A << ","
+         << ang_mean_B << "," << ang_worst_B << "\n";
     _csv.flush();
 
     if (TRACE_WRITE_MESHES && (_frame % std::max(1, TRACE_MESH_STRIDE) == 0))
     {
-        const std::vector<TriMesh> lifted = lifted_meshes_from_mapstate(_map_state);
         const fs::path dir = _output_dir / "trace";
         write_mesh(lifted[0], dir / ("f" + pad4(_frame) + "_" + _kind + "_A.obj"));
         write_mesh(lifted[1], dir / ("f" + pad4(_frame) + "_" + _kind + "_B.obj"));
@@ -575,7 +824,9 @@ void run_config(
         trace_csv.open(output_dir / "trace.csv");
         trace_csv << "frame,kind,label,corr_mean,corr_median,"
                      "residual_mean_aw,residual_area_aw,residual_shape_aw,"
-                     "residual_frac_gt_0p1_aw,n_faces_T,n_verts_T\n";
+                     "residual_frac_gt_0p1_aw,n_faces_T,n_verts_T,"
+                     "drift_mean_deg,drift_max_deg,"
+                     "minang_mean_A,minang_worst_A,minang_mean_B,minang_worst_B\n";
     }
     auto tracer = [&] (const std::string& _kind)
     {
@@ -602,8 +853,14 @@ void run_config(
         settings.use_prescribed_jacobian = prescribed && PRESCRIBED_IN_COARSE_PHASE;
         settings.prescribed_metric_form = true;
         settings.prescribed_mesh_ideal = PRESCRIBED_MESH_IDEAL;
+        settings.mesh_tel_passive = MESH_TEL_PASSIVE;
+        settings.approx_error *= APPROX_ERROR_SCALE;
+        settings.remesh_only = REMESH_ONLY;
+        settings.max_edge_length = std::min(settings.max_edge_length, MAX_EDGE_LENGTH);
+        settings.probe_symmetry = PROBE_SYMMETRY;
         settings.w_map = W_MAP;
         settings.w_mesh = W_MESH;
+        probe_weight_overrides(settings);
         optimize_with_remeshing(map_state, settings, "",
                                 tracer("coarse_optim"), tracer("coarse_remesh"));
     }
@@ -614,9 +871,15 @@ void run_config(
         settings.use_prescribed_jacobian = prescribed;
         settings.prescribed_metric_form = true; // metric form, not the legacy full-J* residual
         settings.prescribed_mesh_ideal = PRESCRIBED_MESH_IDEAL;
+        settings.mesh_tel_passive = MESH_TEL_PASSIVE;
+        settings.approx_error *= APPROX_ERROR_SCALE;
+        settings.remesh_only = REMESH_ONLY;
+        settings.max_edge_length = std::min(settings.max_edge_length, MAX_EDGE_LENGTH);
+        settings.probe_symmetry = PROBE_SYMMETRY;
         settings.w_map = W_MAP;
         settings.w_mesh = W_MESH;
         settings.max_iterations = 50;
+        probe_weight_overrides(settings);
         optimize_with_remeshing(map_state, settings, "",
                                 tracer("fine_optim"), tracer("fine_remesh"));
     }
@@ -660,20 +923,36 @@ void run()
             + std::string(PRESCRIBED_IN_COARSE_PHASE ? "_pcoarse" : "")
             + weight_tag("wmap", W_MAP) + weight_tag("wmesh", W_MESH)
             + std::string(PRESCRIBED_MESH_IDEAL ? "_pmesh" : "")
+            + std::string(MESH_TEL_PASSIVE ? "_telpassive" : "")
+            + weight_tag("approx", APPROX_ERROR_SCALE)
+            + std::string(REMESH_ONLY ? "_frozen" : "")
+            + weight_tag("mel", MAX_EDGE_LENGTH / 100.0)
             + std::string(MOBIUS_FITTED_EMBEDDING_B ? "_mob" : "");
     std::ofstream csv(output_root / ("metrics_" + suffix + ".csv"));
     csv << "config,stage,corr_mean,corr_median,corr_max,"
            "residual_mean,residual_mean_aw,residual_median,residual_median_aw,"
            "residual_p90,residual_max,residual_frac_gt_0p1,residual_frac_gt_0p1_aw,"
            "residual_area_aw,residual_shape_aw,"
-           "n_faces_T,n_verts_T\n";
+           "n_faces_T,n_verts_T,"
+           "drift_mean_deg,drift_max_deg,"
+           "minang_mean_A,minang_worst_A,minang_mean_B,minang_worst_B\n";
 
-    const std::vector<Config> configs = {
-        { PairMode::SelfMap,   EnergyMode::SymmetricDirichlet },
-        { PairMode::SelfMap,   EnergyMode::PrescribedMetric   },
-        { PairMode::Stretched, EnergyMode::SymmetricDirichlet },
-        { PairMode::Stretched, EnergyMode::PrescribedMetric   },
-    };
+    ISM_ASSERT(!(SELF_MAP_ONLY && STRETCHED_ONLY)); // they exclude each other
+    const std::vector<Config> configs = SELF_MAP_ONLY
+        ? std::vector<Config>{
+            { PairMode::SelfMap,   EnergyMode::SymmetricDirichlet },
+          }
+        : STRETCHED_ONLY
+        ? std::vector<Config>{
+            { PairMode::Stretched, EnergyMode::SymmetricDirichlet },
+            { PairMode::Stretched, EnergyMode::PrescribedMetric   },
+          }
+        : std::vector<Config>{
+            { PairMode::SelfMap,   EnergyMode::SymmetricDirichlet },
+            { PairMode::SelfMap,   EnergyMode::PrescribedMetric   },
+            { PairMode::Stretched, EnergyMode::SymmetricDirichlet },
+            { PairMode::Stretched, EnergyMode::PrescribedMetric   },
+          };
 
     std::vector<TriMesh> lifted_As, lifted_Bs;
     std::vector<MapState> states;

@@ -211,6 +211,7 @@ file(GLOB_RECURSE ISM_APPS apps/*.cc)
 set(ISM_HEADLESS_CAPABLE_APPS
     baseline_comparison
     mobius_probe
+    lookup_distortion_probe
 )
 
 if (NOT ISM_BUILD_VIEWER)
