@@ -28,7 +28,7 @@ void view_texture_frontal_projection_T(
         const int &_projection_dir,
         const double& _texture_factor,
         const fs::path& _texture_path,
-        const std::experimental::filesystem::__cxx11::path &screenshot_path,
+        const fs::path &screenshot_path,
         const tg::ivec2 &_size,
         const bool _transparent,
         const glow::viewer::camera_transform &_cam_pos)
@@ -64,7 +64,7 @@ void view_texture_frontal_projection_T(
         const int &_projection_dir,
         const double& _texture_factor,
         const fs::path& _texture_path,
-        const std::experimental::filesystem::__cxx11::path & _screenshot_path,
+        const fs::path & _screenshot_path,
         const tg::ivec2 &_size,
         const bool _transparent,
         const glow::viewer::camera_transform &_cam_pos)
@@ -164,7 +164,7 @@ void view_texture_frontal_projection_input(
         const int &_projection_dir,
         const double& _texture_factor,
         const fs::path& _texture_path,
-        const std::experimental::filesystem::__cxx11::path & _screenshot_path,
+        const fs::path & _screenshot_path,
         const tg::ivec2 &_size,
         const bool _transparent,
         const glow::viewer::camera_transform &_cam_pos)
