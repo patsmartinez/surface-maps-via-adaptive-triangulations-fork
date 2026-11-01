@@ -358,27 +358,47 @@ const int  TRACE_MESH_STRIDE  = 1;
 /// which degenerates the checkerboard into stripes.)
 /// Raise TEXTURE_FACTOR if the checkers are too coarse: init_map normalizes the
 /// meshes to unit surface area, so their coordinates only span ~0.5.
+///
+/// Note it does not mean the same thing in all three TEXTURE_SOURCE schemes, because they
+/// lay out different amounts of uv per unit surface. On a unit-area mesh the uv-per-
+/// world-length works out at ~0.99*factor for Triplanar against sqrt(2)*factor for
+/// Sphere, so Triplanar cells come out ~1.4x coarser at the same number; ~5.7 matches
+/// what Sphere gives at 4.0. Unlike Sphere, Triplanar's cell size is near-uniform (1.5x
+/// spread, measured), so one factor is right everywhere on the mesh.
 const int    TEXTURE_PROJECTION_DIR = 2;
 const double TEXTURE_FACTOR         = 4.0;
 
-/// Take the checkerboard UVs from the SPHERE EMBEDDING instead of projecting along
-/// TEXTURE_PROJECTION_DIR.
+/// Where the checkerboard UVs come from. Three schemes, in the order they were written;
+/// each fixes a defect of the one before.
 ///
-/// The planar projection degenerates on every face parallel to the projection axis, and
-/// the L is a plate extruded along z, so 56% of its area is extrusion wall. Measured on
-/// the lifted T: UV foreshortening 0.98 on the front and back faces but 0.014-0.037 on
-/// the walls, with 33.6% of the area at an effectively ZERO UV area. A collapsed UV
-/// triangle makes the GPU's texture derivatives singular, which is exactly the
-/// shimmering on the top faces and the squashed checkers on the sides. No axis helps:
-/// dir 0 and 1 are worse (45.9% and 43.2% degenerate area against dir 2's 33.6%),
-/// because the L has 12-23% of its area facing each of the six directions.
+/// TexSource::Planar -- the original. Texcoords are the lifted point projected along
+///   TEXTURE_PROJECTION_DIR. Degenerates on every face PARALLEL to the projection axis,
+///   and the L is a plate extruded along z, so 56% of its area is extrusion wall:
+///   measured UV foreshortening 0.98 on the front and back but 0.014-0.037 on the walls,
+///   with 33.6% of the area at an effectively ZERO UV area. A collapsed UV triangle makes
+///   the GPU's texture derivatives singular -- that is the shimmering on the top faces
+///   and the squashed checkers on the sides. No axis helps: dir 0 and 1 are worse (45.9%
+///   and 43.2% degenerate against dir 2's 33.6%), because the L has 12-23% of its area
+///   facing each of the six directions.
 ///
-/// The sphere is the map's own shared domain, so a pattern laid out there is intrinsic to
-/// the surface rather than to the viewing axis. Degenerate only at the two poles.
-/// Keep TEXTURE_FACTOR such that 2*TEXTURE_FACTOR is a whole number: that is the
-/// u-distance of a full wrap, so an integer keeps the tiling texture continuous across
-/// the seam as well as unwrapped across it.
-const bool TEXTURE_FROM_SPHERE = true;
+/// TexSource::Sphere -- UVs as lat-long on the map's own shared domain. Removes the
+///   degeneracy completely (0% collapsed) and is the most faithful to what the algorithm
+///   actually optimizes. But the sphere embedding has its own 51x area distortion, so
+///   cell SIZE varies for reasons that have nothing to do with the map, which makes it
+///   hard to read: a cell can look stretched because the embedding compressed there.
+///   Plus the two poles pinch. Keep 2*TEXTURE_FACTOR a whole number here -- that is the
+///   u-distance of a full wrap, so an integer keeps the tiling continuous across the seam.
+///
+/// TexSource::Triplanar -- each face projected onto whichever coordinate plane it faces
+///   most directly. UV density is bounded in [0.577, 1.0] BY CONSTRUCTION, for any mesh:
+///   never collapses, and at most 1.73x size variation. So cells are near-uniform on the
+///   reference and a stretched cell on the target really is the map stretching. The cost
+///   is that the pattern breaks phase across chart boundaries; on the L those follow the
+///   creases, where a break reads as the geometry.
+///
+/// Read distortion with Triplanar; check what the optimizer sees with Sphere.
+enum class TexSource { Planar, Sphere, Triplanar };
+const TexSource TEXTURE_SOURCE = TexSource::Triplanar;
 
 // ---------------------------------------------------------------------------
 
@@ -1065,14 +1085,18 @@ void run()
             auto g = gv::grid();
             {
                 auto v = gv::view();
-                if (TEXTURE_FROM_SPHERE)
+                if (TEXTURE_SOURCE == TexSource::Triplanar)
+                    view_texture_triplanar_input(states[i], 0, 0, TEXTURE_FACTOR, texture);
+                else if (TEXTURE_SOURCE == TexSource::Sphere)
                     view_texture_sphere_embedding_input(states[i], 0, 0, TEXTURE_FACTOR, texture);
                 else
                     view_texture_frontal_projection_input(states[i], 0, 0, TEXTURE_PROJECTION_DIR, TEXTURE_FACTOR, texture);
             }
             {
                 auto v = gv::view();
-                if (TEXTURE_FROM_SPHERE)
+                if (TEXTURE_SOURCE == TexSource::Triplanar)
+                    view_texture_triplanar_input(states[i], 0, 1, TEXTURE_FACTOR, texture);
+                else if (TEXTURE_SOURCE == TexSource::Sphere)
                     view_texture_sphere_embedding_input(states[i], 0, 1, TEXTURE_FACTOR, texture);
                 else
                     view_texture_frontal_projection_input(states[i], 0, 1, TEXTURE_PROJECTION_DIR, TEXTURE_FACTOR, texture);

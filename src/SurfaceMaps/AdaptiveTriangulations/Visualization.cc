@@ -201,6 +201,111 @@ void view_texture_sphere_embedding_input(
     view_mesh(make_renderable(_map_state.meshes_input[_target_mesh_idx], texcoords_target, _texture));
 }
 
+void view_texture_triplanar_T(
+        const MapState& _map_state,
+        const int _ref_mesh_num,
+        const double& _texture_factor,
+        const fs::path& _texture_path,
+        const fs::path& _screenshot_path,
+        const tg::ivec2& _size,
+        const bool _transparent,
+        const glow::viewer::camera_transform& _cam_pos)
+{
+    int ref = _ref_mesh_num;
+    if (ref >= (int)_map_state.meshes_input.size())
+    {
+        ISM_WARNING("Reference mesh index too large for the triplanar texture. Using 0.");
+        ref = 0;
+    }
+
+    // T lifted onto the reference surface: the geometry whose normals pick the charts.
+    // Exact on this path -- every lifted mesh shares mesh_T's connectivity, so one
+    // per-face chart assignment serves all of them with nothing lost, and a matching
+    // checker means a matching point of the map.
+    const ExternalProperty<VH, Vec3d> pos_ref = lift_to_surface(
+                _map_state.meshes_input[ref], _map_state.mesh_T,
+                _map_state.embeddings_input[ref], _map_state.embeddings_T[ref],
+                _map_state.bsp_embeddings_input[ref]);
+
+    const ExternalProperty<HEH, Vec2d> texcoords_T =
+            triplanar_texcoords(_map_state.mesh_T, pos_ref, _texture_factor);
+
+    glow::SharedTexture2D texture = read_texture(_texture_path);
+    if (!_screenshot_path.empty())
+        fs::create_directories(_screenshot_path.parent_path());
+
+    auto g = gv::grid();
+    for (int i = 0; i < (int)_map_state.meshes_input.size(); ++i)
+    {
+        auto s = _screenshot_path.empty()
+                ? gv::config()
+                : screenshot_config(_screenshot_path.parent_path()
+                                    / (_screenshot_path.stem().string() + "_" + std::to_string(i) + ".png"),
+                                    _cam_pos, _size, _transparent);
+        const TriMesh lifted_T_i = embedding_to_mesh(
+                    _map_state.mesh_T,
+                    lift_to_surface(_map_state.meshes_input[i], _map_state.mesh_T,
+                                    _map_state.embeddings_input[i], _map_state.embeddings_T[i],
+                                    _map_state.bsp_embeddings_input[i]));
+        auto v = gv::view();
+        view_mesh(make_renderable(lifted_T_i, texcoords_T, texture));
+    }
+}
+
+void view_texture_triplanar_input(
+        const MapState& _map_state,
+        const int _source_mesh_idx,
+        const int _target_mesh_idx,
+        const double& _texture_factor,
+        const glow::SharedTexture2D& _texture)
+{
+    const TriMesh& mesh_source = _map_state.meshes_input[_source_mesh_idx];
+    const TriMesh& mesh_target = _map_state.meshes_input[_target_mesh_idx];
+
+    // Transfer the source POSITION to each target vertex, not a texcoord. Same route as
+    // view_texture_frontal_projection_input -- target vertex -> its sphere position -> the
+    // T face containing it -> the same barycentric point on the SOURCE sphere -> the
+    // source face containing that -> interpolate -- but what is interpolated is the
+    // source's 3D position, which is continuous there. That matters: the transfer is
+    // keyed on a vertex and so cannot carry a discontinuity, and a chart jump is not a
+    // periodic shift, so unwrap_texcoord_seam could not repair one. Carrying positions
+    // and choosing the chart afterwards sidesteps the problem instead of patching it.
+    //
+    // Iterating vertices rather than halfedges is also just correct here: the value
+    // depends on heh.to() alone, so the halfedge loop in the older functions recomputes
+    // each vertex once per incident face.
+    ExternalProperty<VH, Vec3d> pos_source_at_target(mesh_target);
+    TriMesh mesh_embedding_T_target = embedding_to_mesh(_map_state.mesh_T, _map_state.embeddings_T[_target_mesh_idx]);
+    BSPTree bsp_T_i(mesh_embedding_T_target);
+    for (auto vh : mesh_target.vertices())
+    {
+        SFH fh_T;
+        double alpha_T, beta_T, gamma_T;
+        bsp_tree_barys_face(_map_state.embeddings_input[_target_mesh_idx][vh], mesh_embedding_T_target, bsp_T_i, alpha_T, beta_T, gamma_T, fh_T);
+        BarycentricPoint bary_T(fh_T, alpha_T, beta_T, _map_state.mesh_T);
+
+        const Vec3d p_emb_on_ref = bary_T.interpolate(_map_state.embeddings_T[_source_mesh_idx], _map_state.mesh_T).normalized();
+
+        SFH fh_ref;
+        double alpha_ref, beta_ref, gamma_ref;
+        bsp_tree_barys_face(p_emb_on_ref, _map_state.meshes_embeddings_input[_source_mesh_idx], _map_state.bsp_embeddings_input[_source_mesh_idx], alpha_ref, beta_ref, gamma_ref, fh_ref);
+
+        SHEH heh_a, heh_b, heh_c;
+        handles(mesh_source, fh_ref, heh_a, heh_b, heh_c);
+        pos_source_at_target[vh] = mesh_source.point(heh_a.to()) * alpha_ref
+                                 + mesh_source.point(heh_b.to()) * beta_ref
+                                 + mesh_source.point(heh_c.to()) * gamma_ref;
+    }
+
+    // Charts picked here, on the TARGET's connectivity, from the SOURCE's geometry: each
+    // target face gets one chart for all three of its corners, so no face ever
+    // interpolates between two projections.
+    const ExternalProperty<HEH, Vec2d> texcoords_target =
+            triplanar_texcoords(mesh_target, pos_source_at_target, _texture_factor);
+
+    view_mesh(make_renderable(mesh_target, texcoords_target, _texture));
+}
+
 /// Show texture mapped to target mesh
 void view_texture_frontal_projection_input(
         const MapState& _map_state,

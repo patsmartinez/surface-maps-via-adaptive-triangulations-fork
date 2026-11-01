@@ -108,4 +108,45 @@ void unwrap_texcoord_seam(
         ExternalProperty<HEH, Vec2d>& _texcoords,
         const double _u_period);
 
+
+/// Checkerboard texture coordinates by PER-FACE DOMINANT-AXIS projection ("triplanar"):
+/// each face is projected onto whichever of the three coordinate planes it faces most
+/// directly.
+///
+/// Why this is the readable one. UV density (UV area per unit surface area) is exactly
+/// |n_k| for the chosen axis k, and for a unit normal max_k |n_k| >= 1/sqrt(3), so the
+/// density is bounded in [0.577, 1.0] -- it CANNOT collapse, and it varies by at most
+/// 1.73x across any mesh whatsoever. That is a guarantee from the construction, not a
+/// property of a particular shape. Compare the two alternatives on the L:
+///   - frontal projection: density down to 0, with 53.75% of the area collapsed;
+///   - sphere lat-long:    no collapse, but a 51x density spread plus two pinched poles.
+/// A bounded, nearly uniform density is what makes the checkers the same size everywhere,
+/// so a cell that looks stretched on the target really is stretched by the map.
+///
+/// The cost, and it is a real one: the chart changes from face to face, so the pattern is
+/// DISCONTINUOUS across a chart boundary -- cells line up in size but not in phase. On a
+/// faceted shape the boundaries follow the creases, where a break in the pattern reads as
+/// the geometry; on a smooth shape they fall in the middle of smooth regions and read as
+/// seams. This is the cube-map trade: uniform cells everywhere, paid for with seams on a
+/// set of curves.
+///
+/// Why it takes _positions instead of reading _mesh.point(). The chart must be a function
+/// of the SOURCE geometry alone, so that two different target meshes pick the same chart
+/// for corresponding material; and it must be chosen on the TARGET's connectivity, so
+/// that a face's three texcoords are always in one chart. Hence the caller transfers the
+/// source POSITION to each target vertex -- a position is continuous on the source, so
+/// the per-vertex transfer in view_texture_*_input loses nothing -- and the chart is
+/// picked here, afterwards. Choosing the chart on the source and transferring the texcoord
+/// does NOT work: that discontinuity is not a periodic shift, so unwrap_texcoord_seam
+/// cannot repair it, and a target face whose vertices landed in different charts would
+/// interpolate between unrelated projections and produce garbage along every boundary.
+///
+/// Same scheme as normal_cluster_tex_coords in Viewer/MeshView.cc (written upstream, never
+/// called), minus its rgb-quadrant tinting. That one projects the mesh's own points, so it
+/// can texture a single mesh but cannot show a map.
+ExternalProperty<HEH, Vec2d> triplanar_texcoords(
+        const TriMesh& _mesh,
+        const ExternalProperty<VH, Vec3d>& _positions,
+        const double _texture_factor);
+
 }
