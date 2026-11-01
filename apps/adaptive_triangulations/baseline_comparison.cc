@@ -52,6 +52,7 @@
 #include <SurfaceMaps/AdaptiveTriangulations/EvaluationMetrics.hh>
 #include <SurfaceMaps/AdaptiveTriangulations/LiftToSurface.hh>
 #include <SurfaceMaps/AdaptiveTriangulations/PrescribedResidual.hh>
+#include <SurfaceMaps/Misc/ConstantCurvatureEmbedding.hh>
 #if ISM_HAS_VIEWER
 #include <SurfaceMaps/AdaptiveTriangulations/Visualization.hh>
 #endif
@@ -360,6 +361,25 @@ const int  TRACE_MESH_STRIDE  = 1;
 const int    TEXTURE_PROJECTION_DIR = 2;
 const double TEXTURE_FACTOR         = 4.0;
 
+/// Take the checkerboard UVs from the SPHERE EMBEDDING instead of projecting along
+/// TEXTURE_PROJECTION_DIR.
+///
+/// The planar projection degenerates on every face parallel to the projection axis, and
+/// the L is a plate extruded along z, so 56% of its area is extrusion wall. Measured on
+/// the lifted T: UV foreshortening 0.98 on the front and back faces but 0.014-0.037 on
+/// the walls, with 33.6% of the area at an effectively ZERO UV area. A collapsed UV
+/// triangle makes the GPU's texture derivatives singular, which is exactly the
+/// shimmering on the top faces and the squashed checkers on the sides. No axis helps:
+/// dir 0 and 1 are worse (45.9% and 43.2% degenerate area against dir 2's 33.6%),
+/// because the L has 12-23% of its area facing each of the six directions.
+///
+/// The sphere is the map's own shared domain, so a pattern laid out there is intrinsic to
+/// the surface rather than to the viewing axis. Degenerate only at the two poles.
+/// Keep TEXTURE_FACTOR such that 2*TEXTURE_FACTOR is a whole number: that is the
+/// u-distance of a full wrap, so an integer keeps the tiling texture continuous across
+/// the seam as well as unwrapped across it.
+const bool TEXTURE_FROM_SPHERE = true;
+
 // ---------------------------------------------------------------------------
 
 /// Compact, filesystem-safe tag for a non-default weight:
@@ -523,6 +543,27 @@ void embedding_drift(
     _mean_deg = sum / (double)_map_state.mesh_T.n_vertices();
 }
 
+/// Flipped-or-degenerate T faces in each of T's two sphere embeddings.
+///
+/// This IS the algorithm's bijectivity invariant, read straight off the degrees of
+/// freedom. The map is "drop each T vertex onto mesh i through sphere i", so it is a
+/// bijection exactly when both embeddings_T[i] are valid (non-inverted) spherical
+/// triangulations; the barrier term exists to keep them that way. Nonzero here means the
+/// map has genuinely lost injectivity, and any rendering artifact is then a symptom.
+/// Zero here means a texture artifact is in the VISUALIZATION, not in the map -- which
+/// matters because a frontal-projection checkerboard has its own degeneracies (see
+/// TEXTURE_PROJECTION_DIR).
+void flipped_T_faces(
+        const MapState& _map_state,
+        int& _flipped_A,
+        int& _flipped_B)
+{
+    _flipped_A = count_flipped(_map_state.mesh_T, _map_state.embeddings_T[0], Spherical);
+    _flipped_B = (_map_state.embeddings_T.size() > 1)
+            ? count_flipped(_map_state.mesh_T, _map_state.embeddings_T[1], Spherical)
+            : 0;
+}
+
 /// Smallest interior angle per triangle, in degrees: averaged over faces, and the worst
 /// face. This is the quantity E_mesh is there to protect (its ideal is equilateral, i.e.
 /// 60 deg), so it says whether down-weighting E_mesh actually degrades T's shape or
@@ -572,6 +613,20 @@ void report(
     double ang_mean_A, ang_worst_A, ang_mean_B, ang_worst_B;
     min_angle_stats(lifted_for_quality[0], ang_mean_A, ang_worst_A);
     min_angle_stats(lifted_for_quality[1], ang_mean_B, ang_worst_B);
+
+    int flipped_A, flipped_B;
+    flipped_T_faces(_map_state, flipped_A, flipped_B);
+
+    if (flipped_A != 0 || flipped_B != 0)
+    {
+        ISM_WARNING("[" << _config_name << " | " << _stage << "] NOT BIJECTIVE: "
+                    << flipped_A << " flipped T faces on A, " << flipped_B << " on B, of "
+                    << _map_state.mesh_T.n_faces());
+    }
+    else
+    {
+        ISM_INFO("[" << _config_name << " | " << _stage << "] bijective: 0 flipped T faces");
+    }
 
     ISM_INFO("[" << _config_name << " | " << _stage << "] "
              << "corr_err mean=" << corr_mean << " median=" << corr_median << " max=" << corr_max
@@ -659,6 +714,15 @@ void trace_step(
     double ang_mean_A, ang_worst_A, ang_mean_B, ang_worst_B;
     min_angle_stats(lifted[0], ang_mean_A, ang_worst_A);
     min_angle_stats(lifted[1], ang_mean_B, ang_worst_B);
+
+    int flipped_A, flipped_B;
+    flipped_T_faces(_map_state, flipped_A, flipped_B);
+    if (flipped_A != 0 || flipped_B != 0)
+    {
+        ISM_WARNING("[trace " << _kind << " " << _label << "] NOT BIJECTIVE: "
+                    << flipped_A << " flipped T faces on A, " << flipped_B << " on B, of "
+                    << _map_state.mesh_T.n_faces());
+    }
 
     // Area-weighted only: T changes size constantly here, so the unweighted numbers
     // would not be comparable from one row to the next.
@@ -1001,11 +1065,17 @@ void run()
             auto g = gv::grid();
             {
                 auto v = gv::view();
-                view_texture_frontal_projection_input(states[i], 0, 0, TEXTURE_PROJECTION_DIR, TEXTURE_FACTOR, texture);
+                if (TEXTURE_FROM_SPHERE)
+                    view_texture_sphere_embedding_input(states[i], 0, 0, TEXTURE_FACTOR, texture);
+                else
+                    view_texture_frontal_projection_input(states[i], 0, 0, TEXTURE_PROJECTION_DIR, TEXTURE_FACTOR, texture);
             }
             {
                 auto v = gv::view();
-                view_texture_frontal_projection_input(states[i], 0, 1, TEXTURE_PROJECTION_DIR, TEXTURE_FACTOR, texture);
+                if (TEXTURE_FROM_SPHERE)
+                    view_texture_sphere_embedding_input(states[i], 0, 1, TEXTURE_FACTOR, texture);
+                else
+                    view_texture_frontal_projection_input(states[i], 0, 1, TEXTURE_PROJECTION_DIR, TEXTURE_FACTOR, texture);
             }
         }
     }

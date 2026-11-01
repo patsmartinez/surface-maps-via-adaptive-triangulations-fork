@@ -124,4 +124,84 @@ double length_diagonal_of_bounding_box(const TriMesh& _mesh)
     return (min_point-max_point).norm();
 }
 
+ExternalProperty<HEH, Vec2d> sphere_embedding_texcoords(
+        const TriMesh& _mesh_T,
+        const ExternalProperty<VH, Vec3d>& _embedding_T,
+        const double _texture_factor)
+{
+    ExternalProperty<HEH, Vec2d> texcoords(_mesh_T);
+
+    // phi in (-pi, pi], theta in [0, pi]; scaled so u spans 2*factor and v spans factor.
+    auto lat_long = [&] (const VH _vh, double& _phi, double& _theta)
+    {
+        const Vec3d p = _embedding_T[_vh].normalized();
+        _phi = std::atan2(p[1], p[0]);
+        _theta = std::acos(std::clamp(p[2], -1.0, 1.0));
+    };
+
+    for (auto fh : _mesh_T.faces())
+    {
+        VH vh_a, vh_b, vh_c;
+        handles(_mesh_T, fh, vh_a, vh_b, vh_c);
+
+        double phi_a, theta_a, phi_b, theta_b, phi_c, theta_c;
+        lat_long(vh_a, phi_a, theta_a);
+        lat_long(vh_b, phi_b, theta_b);
+        lat_long(vh_c, phi_c, theta_c);
+
+        // Unwrap b and c into the branch of a, so a face straddling the +-pi meridian
+        // gets continuous phi instead of a jump of nearly 2*pi.
+        const auto unwrap = [&] (double& _phi)
+        {
+            while (_phi - phi_a >  M_PI) _phi -= 2.0 * M_PI;
+            while (_phi - phi_a < -M_PI) _phi += 2.0 * M_PI;
+        };
+        unwrap(phi_b);
+        unwrap(phi_c);
+
+        const double s = _texture_factor / M_PI;
+        const Vec2d uv_a(phi_a * s, theta_a * s);
+        const Vec2d uv_b(phi_b * s, theta_b * s);
+        const Vec2d uv_c(phi_c * s, theta_c * s);
+
+        // Per-halfedge, so each face keeps its own unwrapped values. A halfedge's
+        // texcoord belongs to the vertex it points TO, matching the frontal-projection
+        // convention in Visualization.cc.
+        for (auto heh : _mesh_T.fh_range(fh))
+        {
+            const VH to = heh.to();
+            if (to == vh_a)      texcoords[heh] = uv_a;
+            else if (to == vh_b) texcoords[heh] = uv_b;
+            else                 texcoords[heh] = uv_c;
+        }
+    }
+
+    return texcoords;
+}
+
+void unwrap_texcoord_seam(
+        const TriMesh& _mesh,
+        ExternalProperty<HEH, Vec2d>& _texcoords,
+        const double _u_period)
+{
+    if (_u_period <= 0.0)
+        return;
+
+    const double half = 0.5 * _u_period;
+    for (auto fh : _mesh.faces())
+    {
+        HEH heh_a, heh_b, heh_c;
+        handles(_mesh, fh, heh_a, heh_b, heh_c);
+
+        const double u_ref = _texcoords[heh_a][0];
+        for (HEH heh : { heh_b, heh_c })
+        {
+            double u = _texcoords[heh][0];
+            while (u - u_ref >  half) u -= _u_period;
+            while (u - u_ref < -half) u += _u_period;
+            _texcoords[heh] = Vec2d(u, _texcoords[heh][1]);
+        }
+    }
+}
+
 }

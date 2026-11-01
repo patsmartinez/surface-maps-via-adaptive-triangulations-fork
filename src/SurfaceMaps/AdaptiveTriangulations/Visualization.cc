@@ -109,6 +109,98 @@ void view_texture_frontal_projection_T(
     }
 }
 
+void view_texture_sphere_embedding_T(
+        const MapState& _map_state,
+        const int _ref_mesh_num,
+        const double& _texture_factor,
+        const fs::path& _texture_path,
+        const fs::path& _screenshot_path,
+        const tg::ivec2& _size,
+        const bool _transparent,
+        const glow::viewer::camera_transform& _cam_pos)
+{
+    int ref = _ref_mesh_num;
+    if (ref >= (int)_map_state.meshes_input.size())
+    {
+        ISM_WARNING("Reference mesh index too large for the sphere texture. Using 0.");
+        ref = 0;
+    }
+
+    // Built ONCE from the reference sphere, then reused for every mesh: that is what
+    // makes a matching checker mean a matching point of the map rather than just a
+    // matching position in space.
+    const ExternalProperty<HEH, Vec2d> texcoords_T =
+            sphere_embedding_texcoords(_map_state.mesh_T, _map_state.embeddings_T[ref], _texture_factor);
+
+    glow::SharedTexture2D texture = read_texture(_texture_path);
+    if (!_screenshot_path.empty())
+        fs::create_directories(_screenshot_path.parent_path());
+
+    auto g = gv::grid();
+    for (int i = 0; i < (int)_map_state.meshes_input.size(); ++i)
+    {
+        auto s = _screenshot_path.empty()
+                ? gv::config()
+                : screenshot_config(_screenshot_path.parent_path()
+                                    / (_screenshot_path.stem().string() + "_" + std::to_string(i) + ".png"),
+                                    _cam_pos, _size, _transparent);
+        const TriMesh lifted_T_i = embedding_to_mesh(
+                    _map_state.mesh_T,
+                    lift_to_surface(_map_state.meshes_input[i], _map_state.mesh_T,
+                                    _map_state.embeddings_input[i], _map_state.embeddings_T[i],
+                                    _map_state.bsp_embeddings_input[i]));
+        auto v = gv::view();
+        view_mesh(make_renderable(lifted_T_i, texcoords_T, texture));
+    }
+}
+
+void view_texture_sphere_embedding_input(
+        const MapState& _map_state,
+        const int _source_mesh_idx,
+        const int _target_mesh_idx,
+        const double& _texture_factor,
+        const glow::SharedTexture2D& _texture)
+{
+    // Source texcoords from the source mesh's own sphere embedding, already unwrapped
+    // per face, so the barycentric interpolation below reads three consistent values.
+    ExternalProperty<HEH, Vec2d> texcoords_source = sphere_embedding_texcoords(
+                _map_state.meshes_input[_source_mesh_idx],
+                _map_state.embeddings_input[_source_mesh_idx],
+                _texture_factor);
+
+    // Transfer, identical in structure to the frontal-projection version: target vertex
+    // -> its sphere position -> the T face containing it -> the same barycentric point on
+    // the SOURCE sphere -> the source face containing that -> interpolate its texcoords.
+    ExternalProperty<HEH, Vec2d> texcoords_target(_map_state.meshes_input[_target_mesh_idx]);
+    TriMesh mesh_embedding_T_target = embedding_to_mesh(_map_state.mesh_T, _map_state.embeddings_T[_target_mesh_idx]);
+    BSPTree bsp_T_i(mesh_embedding_T_target);
+    for (auto heh : _map_state.meshes_input[_target_mesh_idx].halfedges())
+    {
+        SVH v_to = heh.to();
+        SFH fh_T;
+        double alpha_T, beta_T, gamma_T;
+        bsp_tree_barys_face(_map_state.embeddings_input[_target_mesh_idx][v_to], mesh_embedding_T_target, bsp_T_i, alpha_T, beta_T, gamma_T, fh_T);
+        BarycentricPoint bary_T(fh_T, alpha_T, beta_T, _map_state.mesh_T);
+
+        const Vec3d p_emb_on_ref = bary_T.interpolate(_map_state.embeddings_T[_source_mesh_idx], _map_state.mesh_T).normalized();
+
+        SFH fh_ref;
+        double alpha_ref, beta_ref, gamma_ref;
+        bsp_tree_barys_face(p_emb_on_ref, _map_state.meshes_embeddings_input[_source_mesh_idx], _map_state.bsp_embeddings_input[_source_mesh_idx], alpha_ref, beta_ref, gamma_ref, fh_ref);
+
+        SHEH heh_a, heh_b, heh_c;
+        handles(_map_state.meshes_input[_source_mesh_idx], fh_ref, heh_a, heh_b, heh_c);
+        texcoords_target[heh] = texcoords_source[heh_a] * alpha_ref + texcoords_source[heh_b] * beta_ref + texcoords_source[heh_c] * gamma_ref;
+    }
+
+    // The transfer above keys the value on heh.to() only, so it is effectively
+    // per-vertex and cannot carry the seam. Repair it per face; harmless for a scheme
+    // without a seam, essential for this one.
+    unwrap_texcoord_seam(_map_state.meshes_input[_target_mesh_idx], texcoords_target, 2.0 * _texture_factor);
+
+    view_mesh(make_renderable(_map_state.meshes_input[_target_mesh_idx], texcoords_target, _texture));
+}
+
 /// Show texture mapped to target mesh
 void view_texture_frontal_projection_input(
         const MapState& _map_state,
