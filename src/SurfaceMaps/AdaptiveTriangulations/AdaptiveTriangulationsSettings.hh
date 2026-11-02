@@ -85,6 +85,46 @@ struct AdaptiveTriangulationsSettings
     /// no derivative. Off by default so the published algorithm stays reproducible.
     bool mesh_tel_passive = false;
 
+    /// MAP-DRIVEN sizing field (prototype): also refine T where the PRESCRIBED metric
+    /// jumps, not only where the surface curves. Combined with the curvature field by
+    /// min, inside init_target_edge_lengths. See map_driven_target_edge_lengths.
+    ///
+    /// Needs mesh_tel_passive. With tel active, E_mesh differentiates its own sizing
+    /// field, and a field that depends on the prescription would make that coupling
+    /// structural rather than accidental -- that bug produced gradients ~1e9 against
+    /// E_map's 1.6.
+    ///
+    /// The field acts ONLY through E_mesh, which w_mesh scales. Remeshing splits when
+    /// they improve the TOTAL energy, so at w_mesh = 0.01 a 4x finer tel in a thin band
+    /// is a (4)^2 = 16x local E_mesh signal, down-weighted 100x. The global cap worked at
+    /// that weight because it changed tel by ~3000x. So expect to need a larger w_mesh
+    /// for this to bite, and check n_faces_T_band in the report before believing it did.
+    bool map_driven_tel = false;
+
+    /// Target edge length on the seam itself. The one knob that costs: measured on the L,
+    /// 0.015 is ~1.55x the faces, 0.0075 is ~3.75x, 0.00375 is ~12.6x. Do not go below
+    /// the local INPUT edge length (0.0629 on the L, 0.0149 on the U) expecting more
+    /// information -- the prescribed field is constant within an input face, so finer
+    /// than that only resolves the seam's position, not its values.
+    double map_tel_floor = 0.015;
+
+    /// Gradation: tel grows as floor + g * distance-to-seam. A size-per-length, so it is
+    /// independent of input mesh resolution. 0.2-1.0 is the usual meshing range; the cost
+    /// is nearly flat in g (3-12% of face count from 0.25 to infinity), so there is no
+    /// reason to tune it.
+    double map_tel_gradation = 0.5;
+
+    /// Rings the seam is dilated by before the gradation starts. Needed because tel is
+    /// read by a single centroid sample per T triangle, so a band thinner than an element
+    /// is invisible to it. 2 is the safe default; 1 is marginal on a mesh as fine as the U.
+    int map_tel_min_rings = 2;
+
+    /// Jump magnitude above which an edge counts as seam, in log-singular-value units.
+    /// Well separated in practice: the L's seam doubles sigma_max, i.e. log 2 = 0.69,
+    /// while a flat region reads ~1e-15, and any threshold in [1e-4, 1e-2] picked out the
+    /// identical face set when measured.
+    double map_tel_jump_thresh = 0.05;
+
     /// Run the remeshing passes but take NO Newton step: optimize_map returns
     /// immediately, before touching any vertex.
     ///

@@ -65,6 +65,43 @@ void init_target_edge_lengths(
         _map_state.tels_input.push_back(target_edge_lengths(_map_state.meshes_input[i], _settings.approx_error * sqrt(factor_A_to_i_area[i]), _settings.min_edge_length * sqrt(factor_A_to_i_area[i]), _settings.max_edge_length * sqrt(factor_A_to_i_area[i])));
 
     ISM_ASSERT_EQ(_map_state.meshes_input.size(), _map_state.tels_input.size());
+
+    // Map-driven refinement, folded into the SAME per-vertex field by min, so nothing
+    // downstream changes: pick_target_edge_length, the remesher and E_mesh all just read
+    // tels_input as before.
+    //
+    // Only mesh 0 gets it. The prescribed field describes the map A -> B and is indexed by
+    // A's faces, so there is no counterpart on B -- and none is needed: the energy takes
+    // fmin(tel_A, tel_B), so A's finer value wins wherever the band asks for it.
+    if (_settings.map_driven_tel && !_map_state.prescribed_jacobians.empty())
+    {
+        ISM_ASSERT(_settings.mesh_tel_passive); // see settings.map_driven_tel
+
+        int n_seam_verts = 0;
+        const auto tel_map = map_driven_target_edge_lengths(
+                    _map_state.meshes_input[0], _map_state.prescribed_jacobians[0],
+                    _settings.map_tel_jump_thresh, _settings.map_tel_floor,
+                    _settings.map_tel_gradation, _settings.map_tel_min_rings, n_seam_verts);
+
+        int n_lowered = 0;
+        for (auto vh : _map_state.meshes_input[0].vertices())
+        {
+            if (tel_map[vh] < _map_state.tels_input[0][vh])
+            {
+                _map_state.tels_input[0][vh] = tel_map[vh];
+                ++n_lowered;
+            }
+        }
+
+        ISM_INFO("Map-driven tel: " << n_seam_verts << " seam vertices, "
+                 << n_lowered << " of " << _map_state.meshes_input[0].n_vertices()
+                 << " tels lowered (floor " << _settings.map_tel_floor
+                 << ", g " << _settings.map_tel_gradation
+                 << ", " << _settings.map_tel_min_rings << " rings)");
+
+        if (n_seam_verts == 0)
+            ISM_WARNING("Map-driven tel found no seam: the prescribed field varies less than map_tel_jump_thresh everywhere, so this is a no-op.");
+    }
 }
 
 

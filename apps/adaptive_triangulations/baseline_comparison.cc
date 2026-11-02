@@ -51,6 +51,7 @@
 #include <SurfaceMaps/AdaptiveTriangulations/AssignVerticesToFaces.hh>
 #include <SurfaceMaps/AdaptiveTriangulations/EvaluationMetrics.hh>
 #include <SurfaceMaps/AdaptiveTriangulations/LiftToSurface.hh>
+#include <SurfaceMaps/AdaptiveTriangulations/AdaptiveTargetEdgeLength.hh>
 #include <SurfaceMaps/AdaptiveTriangulations/PrescribedResidual.hh>
 #include <SurfaceMaps/Misc/ConstantCurvatureEmbedding.hh>
 #if ISM_HAS_VIEWER
@@ -410,6 +411,21 @@ const TexSource TEXTURE_SOURCE = TexSource::Triplanar;
 const bool   LANDMARK_BALLS         = true;
 const double LANDMARK_RADIUS_FACTOR = 0.015;
 
+/// Map-driven sizing field (PROTOTYPE). Refine T where the PRESCRIBED metric jumps, not
+/// only where the surface curves. See map_driven_target_edge_lengths in
+/// AdaptiveTargetEdgeLength.hh for the construction and AdaptiveTriangulationsSettings
+/// for what each number means.
+///
+/// Requires MESH_TEL_PASSIVE. The field only acts through E_mesh, so W_MESH scales how
+/// much authority it has: at 0.01 a 2x finer tel in a thin band is a 4x local E_mesh
+/// signal, down-weighted 100x, which may not be enough to fire any split. Check
+/// n_band_T in the CSV before concluding anything -- if it does not move, the field was
+/// outvoted rather than wrong, and the thing to change is W_MESH, not the floor.
+const bool   MAP_DRIVEN_TEL    = false;
+const double MAP_TEL_FLOOR     = 0.015;
+const double MAP_TEL_GRADATION = 0.5;
+const int    MAP_TEL_MIN_RINGS = 2;
+
 // ---------------------------------------------------------------------------
 
 /// Compact, filesystem-safe tag for a non-default weight:
@@ -468,6 +484,7 @@ struct Config
              + weight_tag("approx", APPROX_ERROR_SCALE)
              + (REMESH_ONLY ? "_frozen" : "")
              + weight_tag("mel", MAX_EDGE_LENGTH / 100.0)
+             + (MAP_DRIVEN_TEL ? ("_mdtel" + weight_tag("floor", MAP_TEL_FLOOR)) : "")
              + ((pair_mode == PairMode::Stretched && MOBIUS_FITTED_EMBEDDING_B
                  && !START_FROM_GROUND_TRUTH) ? "_mob" : "");
     }
@@ -624,6 +641,46 @@ void min_angle_stats(
     _mean_deg = sum / (double)_mesh.n_faces();
 }
 
+/// T faces sitting in the map-driven refinement band, i.e. whose SAMPLED target edge
+/// length is close to the floor.
+///
+/// This is the diagnostic that decides whether MAP_DRIVEN_TEL did anything at all. The
+/// field acts only through E_mesh, and remeshing splits only when they improve the TOTAL
+/// energy, so at a small W_MESH the band can be asked for and simply never materialize.
+/// If this count does not rise when the field is switched on, the field was OUTVOTED, not
+/// wrong -- raise W_MESH rather than lowering the floor.
+///
+/// Sampled exactly the way E_mesh samples it (one lookup at the T face's sphere
+/// centroid), so it reports what the optimizer actually saw, not what the field holds.
+///
+/// Counted whether or not MAP_DRIVEN_TEL is on, because the number is only meaningful as
+/// a DIFFERENCE: the curvature field alone already drives some faces below this threshold
+/// (85 of 1868 on the L's self-map, where the prescribed field is the identity and the
+/// map-driven term is correctly a no-op), so the absolute count is not the band size.
+int count_band_T_faces(
+        const MapState& _map_state,
+        const double _floor)
+{
+    if (_map_state.tels_input.empty())
+        return 0;
+
+    int n = 0;
+    for (auto fh : _map_state.mesh_T.faces())
+    {
+        VH vh_a, vh_b, vh_c;
+        handles(_map_state.mesh_T, fh, vh_a, vh_b, vh_c);
+        const double tel = ideal_triangle_edge_length(
+                    _map_state.embeddings_T[0][vh_a],
+                    _map_state.embeddings_T[0][vh_b],
+                    _map_state.embeddings_T[0][vh_c],
+                    _map_state.meshes_input[0], _map_state.meshes_embeddings_input[0],
+                    _map_state.tels_input[0], _map_state.bsp_embeddings_input[0]);
+        if (tel < 1.5 * _floor)
+            ++n;
+    }
+    return n;
+}
+
 void report(
         const MapState& _map_state,
         const std::string& _config_name,
@@ -647,6 +704,8 @@ void report(
     int flipped_A, flipped_B;
     flipped_T_faces(_map_state, flipped_A, flipped_B);
 
+    const int n_band_T = count_band_T_faces(_map_state, MAP_TEL_FLOOR);
+
     if (flipped_A != 0 || flipped_B != 0)
     {
         ISM_WARNING("[" << _config_name << " | " << _stage << "] NOT BIJECTIVE: "
@@ -668,7 +727,8 @@ void report(
              << " | |V(T)|=" << _map_state.mesh_T.n_vertices()
              << " | drift mean=" << drift_mean << " max=" << drift_max << " deg"
              << " | min-angle A " << ang_mean_A << "/" << ang_worst_A
-             << " B " << ang_mean_B << "/" << ang_worst_B);
+             << " B " << ang_mean_B << "/" << ang_worst_B
+             << (MAP_DRIVEN_TEL ? (" | band faces " + std::to_string(n_band_T)) : ""));
 
     _csv << _config_name << "," << _stage << ","
          << corr_mean << "," << corr_median << "," << corr_max << ","
@@ -677,6 +737,7 @@ void report(
          << res.frac_gt_0p1 << "," << res.frac_gt_0p1_aw << ","
          << res.area_part_aw << "," << res.shape_part_aw << ","
          << res.n_faces << "," << _map_state.mesh_T.n_vertices() << ","
+         << n_band_T << ","
          << drift_mean << "," << drift_max << ","
          << ang_mean_A << "," << ang_worst_A << ","
          << ang_mean_B << "," << ang_worst_B << "\n";
@@ -948,6 +1009,10 @@ void run_config(
         settings.prescribed_metric_form = true;
         settings.prescribed_mesh_ideal = PRESCRIBED_MESH_IDEAL;
         settings.mesh_tel_passive = MESH_TEL_PASSIVE;
+        settings.map_driven_tel = MAP_DRIVEN_TEL;
+        settings.map_tel_floor = MAP_TEL_FLOOR;
+        settings.map_tel_gradation = MAP_TEL_GRADATION;
+        settings.map_tel_min_rings = MAP_TEL_MIN_RINGS;
         settings.approx_error *= APPROX_ERROR_SCALE;
         settings.remesh_only = REMESH_ONLY;
         settings.max_edge_length = std::min(settings.max_edge_length, MAX_EDGE_LENGTH);
@@ -966,6 +1031,10 @@ void run_config(
         settings.prescribed_metric_form = true; // metric form, not the legacy full-J* residual
         settings.prescribed_mesh_ideal = PRESCRIBED_MESH_IDEAL;
         settings.mesh_tel_passive = MESH_TEL_PASSIVE;
+        settings.map_driven_tel = MAP_DRIVEN_TEL;
+        settings.map_tel_floor = MAP_TEL_FLOOR;
+        settings.map_tel_gradation = MAP_TEL_GRADATION;
+        settings.map_tel_min_rings = MAP_TEL_MIN_RINGS;
         settings.approx_error *= APPROX_ERROR_SCALE;
         settings.remesh_only = REMESH_ONLY;
         settings.max_edge_length = std::min(settings.max_edge_length, MAX_EDGE_LENGTH);
@@ -1021,13 +1090,14 @@ void run()
             + weight_tag("approx", APPROX_ERROR_SCALE)
             + std::string(REMESH_ONLY ? "_frozen" : "")
             + weight_tag("mel", MAX_EDGE_LENGTH / 100.0)
+            + (MAP_DRIVEN_TEL ? ("_mdtel" + weight_tag("floor", MAP_TEL_FLOOR)) : "")
             + std::string(MOBIUS_FITTED_EMBEDDING_B ? "_mob" : "");
     std::ofstream csv(output_root / ("metrics_" + suffix + ".csv"));
     csv << "config,stage,corr_mean,corr_median,corr_max,"
            "residual_mean,residual_mean_aw,residual_median,residual_median_aw,"
            "residual_p90,residual_max,residual_frac_gt_0p1,residual_frac_gt_0p1_aw,"
            "residual_area_aw,residual_shape_aw,"
-           "n_faces_T,n_verts_T,"
+           "n_faces_T,n_verts_T,n_band_T,"
            "drift_mean_deg,drift_max_deg,"
            "minang_mean_A,minang_worst_A,minang_mean_B,minang_worst_B\n";
 
