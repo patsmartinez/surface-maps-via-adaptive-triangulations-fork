@@ -400,6 +400,16 @@ const double TEXTURE_FACTOR         = 4.0;
 enum class TexSource { Planar, Sphere, Triplanar };
 const TexSource TEXTURE_SOURCE = TexSource::Triplanar;
 
+/// Extra render showing the landmarks as world-space balls on each input mesh.
+///
+/// The larger ball is T's landmark lifted onto the mesh (where the map puts it), the
+/// smaller one is the landmark pinned on the input mesh (where it should be), same colour
+/// per landmark across the grid. The small one hides inside the large one when the
+/// constraint holds, so: one ball = satisfied, two balls = drift, and the gap is the
+/// error. Radius is relative to the bounding-box diagonal.
+const bool   LANDMARK_BALLS         = true;
+const double LANDMARK_RADIUS_FACTOR = 0.015;
+
 // ---------------------------------------------------------------------------
 
 /// Compact, filesystem-safe tag for a non-default weight:
@@ -1101,6 +1111,13 @@ void run()
                 else
                     view_texture_frontal_projection_input(states[i], 0, 1, TEXTURE_PROJECTION_DIR, TEXTURE_FACTOR, texture);
             }
+        }
+
+        if (LANDMARK_BALLS)
+        {
+            auto s = screenshot_config(OPEN_VIEWER, screenshot_dir / (name + "_landmarks.png"), tg::ivec2(1920, 1080), true);
+            auto style = default_style();
+            view_landmark_balls(states[i], LANDMARK_RADIUS_FACTOR, true);
         }
     }
 

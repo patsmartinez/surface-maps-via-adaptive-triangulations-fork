@@ -148,8 +148,41 @@ void view_lifted_with_landmarks_in_meshes(
         const bool _transparent= false,
         const glow::viewer::camera_transform& _cam_pos= glow::viewer::camera_transform(tg::pos3(-0.081837f, 0.306927f, 2.645693f), tg::pos3(0.f, 0.f, 0.f)));
 
+/// Landmarks as world-space BALLS on each input mesh, rather than as screen-space dots.
+///
+/// Why: default_point_style is WidthScreen(4, true) -- a flat 4-pixel sprite whose size
+/// does not change with zoom and which carries no depth, so landmarks are hard to find
+/// and impossible to place relative to the surface. A ball has a radius in world units,
+/// so it occludes and is occluded correctly, and zooming in actually helps.
+///
+/// Colours come from ColorGenerator in landmark order, so landmark j is the SAME colour
+/// on every mesh in the grid -- that is what makes the correspondence readable.
+///
+/// Two balls per landmark, when _show_T_landmarks is set:
+///   - the larger one is the landmark pinned on the INPUT mesh (where it should be);
+///   - the smaller one is T's landmark lifted onto that mesh (where the map puts it).
+/// The small one sits inside the large one when the constraint is satisfied, so the read
+/// is simply: ONE ball means satisfied, TWO balls means the map has drifted, and the gap
+/// is the error. No arrows needed (contrast view_lifted_with_landmarks_in_meshes, which
+/// draws the displacement explicitly but needs the arrow-length special cases).
+///
+/// _radius_factor is relative to the mesh's bounding-box diagonal, so it is independent
+/// of the unit-surface-area normalization that init_map applies.
+void view_landmark_balls(
+        const MapState& _map_state,
+        const double _radius_factor = 0.015,
+        const bool _show_T_landmarks = true,
+        const fs::path& _screenshot_path = "",
+        const tg::ivec2& _size = tg::ivec2(1920, 1080),
+        const bool _transparent = false,
+        const glow::viewer::camera_transform& _cam_pos = glow::viewer::camera_transform(tg::pos3(-0.081837f, 0.306927f, 2.645693f), tg::pos3(0.f, 0.f, 0.f)));
+
+/// _radius is in sphere units (the embeddings are unit spheres), and is a world-space
+/// ball radius -- see view_landmark_balls for why that beats a screen-space dot. Pass 0
+/// to get the old 8px/16px screen-space dots back.
 void view_landmarks_on_spheres(
         const MapState& _map_state,
+        const double _radius = 0.03,
         const fs::path& _screenshot_path = "",
         const tg::ivec2& _size= tg::ivec2(1920, 1080),
         const bool _transparent= false,

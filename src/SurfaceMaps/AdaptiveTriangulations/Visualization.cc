@@ -506,6 +506,12 @@ void view_lifted_with_landmarks_in_meshes(
                 view_mesh(_map_state.meshes_input[i], Color(1.0, 1.0, 1.0, 0.3));
                 view_wireframe(lifted_T_i, MAGENTA);
                 //view_wireframe(_map_state.meshes_input[i], Color(1.0, 1.0, 1.0, 0.7));
+                // World-space balls as well as the canvas dots below: a canvas dot is
+                // screen-space and so vanishes when zoomed out. Same colour order, so a
+                // ball pairs with its arrow. See view_landmark_balls.
+                view_landmarks(lifted_T_i, _map_state.landmarks_T, WidthWorld(2.0f * world_size, true));
+                view_landmarks(_map_state.meshes_input[i], _map_state.landmarks_input[i], WidthWorld(world_size, true));
+
                 ColorGenerator colors;
                 for (auto j=0; j< (int)_map_state.landmarks_input[i].size(); j++)
                 {
@@ -528,8 +534,54 @@ void view_lifted_with_landmarks_in_meshes(
 }
 
 
+void view_landmark_balls(
+        const MapState& _map_state,
+        const double _radius_factor,
+        const bool _show_T_landmarks,
+        const fs::path& _screenshot_path,
+        const tg::ivec2& _size,
+        const bool _transparent,
+        const glow::viewer::camera_transform& _cam_pos)
+{
+    if (!_screenshot_path.empty())
+        fs::create_directories(_screenshot_path.parent_path());
+
+    auto g = gv::grid();
+    for (int i = 0; i < (int)_map_state.meshes_input.size(); ++i)
+    {
+        auto s = _screenshot_path.empty()
+                ? gv::config()
+                : screenshot_config(_screenshot_path.parent_path()
+                                    / (_screenshot_path.stem().string() + "_" + std::to_string(i) + ".png"),
+                                    _cam_pos, _size, _transparent);
+        auto v = gv::view();
+
+        // Relative to the bounding box, so one factor works whatever the normalization.
+        const double radius = _radius_factor * bb_diag(_map_state.meshes_input[i]);
+
+        view_mesh(_map_state.meshes_input[i], Color(0.85, 0.85, 0.85, 1.0));
+
+        // Where the map currently puts each landmark. Drawn FIRST and larger so that an
+        // input landmark still agreeing with it is hidden inside it.
+        if (_show_T_landmarks && !_map_state.landmarks_T.empty())
+        {
+            const TriMesh lifted_T_i = embedding_to_mesh(
+                        _map_state.mesh_T,
+                        lift_to_surface(_map_state.meshes_input[i], _map_state.mesh_T,
+                                        _map_state.embeddings_input[i], _map_state.embeddings_T[i],
+                                        _map_state.bsp_embeddings_input[i]));
+            view_landmarks(lifted_T_i, _map_state.landmarks_T, WidthWorld(radius, true));
+        }
+
+        // Where it should be: the landmark pinned on the input mesh.
+        if (i < (int)_map_state.landmarks_input.size())
+            view_landmarks(_map_state.meshes_input[i], _map_state.landmarks_input[i], WidthWorld(0.5f * radius, true));
+    }
+}
+
 void view_landmarks_on_spheres(
         const MapState& _map_state,
+        const double _radius,
         const fs::path& _screenshot_path,
         const tg::ivec2& _size,
         const bool _transparent,
@@ -548,10 +600,20 @@ void view_landmarks_on_spheres(
         auto v = gv::view();
         view_ccm_embedding(_map_state.meshes_input[i], _map_state.embeddings_input[i], Spherical, BLUE_50);
         view_ccm_embedding(_map_state.mesh_T, _map_state.embeddings_T[i], Spherical, MAGENTA);
-        point_style.width = 8.0;
-        view_landmarks(_map_state.meshes_input[i], _map_state.embeddings_input[i], _map_state.landmarks_input[i], point_style);
-        point_style.width = 16.0;
-        view_landmarks(_map_state.mesh_T, _map_state.embeddings_T[i], _map_state.landmarks_T, point_style);
+        if (_radius > 0.0)
+        {
+            // Balls, in sphere units. T's is the larger, so an input landmark that still
+            // agrees with it disappears inside it: one ball means the constraint holds.
+            view_landmarks(_map_state.meshes_input[i], _map_state.embeddings_input[i], _map_state.landmarks_input[i], WidthWorld(0.5f * _radius, true));
+            view_landmarks(_map_state.mesh_T, _map_state.embeddings_T[i], _map_state.landmarks_T, WidthWorld(_radius, true));
+        }
+        else
+        {
+            point_style.width = 8.0;
+            view_landmarks(_map_state.meshes_input[i], _map_state.embeddings_input[i], _map_state.landmarks_input[i], point_style);
+            point_style.width = 16.0;
+            view_landmarks(_map_state.mesh_T, _map_state.embeddings_T[i], _map_state.landmarks_T, point_style);
+        }
     }
 }
 
