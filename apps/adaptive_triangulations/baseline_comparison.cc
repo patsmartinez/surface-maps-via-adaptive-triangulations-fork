@@ -91,9 +91,9 @@ namespace SurfaceMaps
 ///            cone points and the developable regions give the energy soft modes.
 ///   u_shape: 5852 verts. Base stretched 2x in x, both arms translated +-0.65 rigidly,
 ///            transition at |x| ~ 0.65. 7.4x bigger, so runs are substantially slower.
-const std::string MESH_DIR = "meshes/l_shape";
-const std::string MESH_A   = "newL.obj";
-const std::string MESH_B   = "stretchedL.obj";
+const std::string MESH_DIR = "meshes/sphere";
+const std::string MESH_A   = "sphere.obj";
+const std::string MESH_B   = "ellipse1.obj";
 
 /// 8 / 16 / 32 swept. 16 was marginally best (corr 0.0062 vs 0.0074) and gave the widest
 /// prescribed-vs-dirichlet gap (4.6x); 32 degrades 2.3x and collapses the gap to 1.03x,
@@ -101,6 +101,25 @@ const std::string MESH_B   = "stretchedL.obj";
 /// Held at 8 so the W_MESH sweep below is directly comparable to the W_MAP sweep.
 const int  N_FPS_LANDMARKS = 16;
 const bool OPEN_VIEWER     = true; // false = write screenshots instead
+
+/// Release the landmarks after the landmark phase -- which is what EVERY upstream app
+/// does and this one never did (n_meshes.cc:115, approximation.cc:42,
+/// resolution_T.cc:124, curvature_based_sizing.cc:112, initialization_hands.cc:87, all
+/// of them immediately after landmark_phase() and before coarse_phase()).
+///
+/// With this OFF, coarse_phase_settings() and fine_phase_settings() set
+/// hard_landmark_constraints = true, and OptimizeMap.cc:62 then ELIMINATES
+/// 2 * n_meshes * n_landmarks DOFs via the constraint matrix C -- so the N_FPS_LANDMARKS
+/// landmark vertices of T are frozen on BOTH spheres for the entire coarse and fine
+/// phases. Those correspondences are then decided by farthest-point sampling plus the
+/// landmark phase rather than by the energy, which is not how the paper runs the
+/// algorithm, and is the suspected cause of the N_FPS_LANDMARKS sweep collapsing: 32
+/// landmarks degraded corr 2.3x and shrank the prescribed-vs-dirichlet gap from 4.6x to
+/// 1.03x (see the note on N_FPS_LANDMARKS above).
+///
+/// Nothing else in this app reads the landmarks after the phases except
+/// view_landmark_balls, which simply draws nothing once they are released.
+const bool RELEASE_LANDMARKS = true;
 
 /// Ablation, A-on-B configs only: give mesh B the SAME sphere embedding as mesh A.
 /// The two L meshes share connectivity, so the initial map is then exactly the
@@ -144,7 +163,7 @@ const double W_MAP = 1.0;
 /// most of the W_MAP = 100 gain. If it does, the honest fix is prescription-aware ideal
 /// triangles -- apply the already-looked-up V and Sigma to the ideal on the B side --
 /// rather than a 100x multiplier on the map term.
-const double W_MESH = 1.0;
+const double W_MESH = 0.01;
 
 /// PRIORITY 3: make E_mesh prescription-aware instead of down-weighting it.
 ///
@@ -345,7 +364,7 @@ const bool REMESH_ONLY = false;
 ///   max_el 0.03-> |F(T)| 4628, lookup error 0.00120
 /// 39x less lookup error for 2.3x the faces. The L barely moves (0.0035 -> 0.0046), so
 /// the mechanism is specific to shapes with large flat regions.
-const double MAX_EDGE_LENGTH = 100.0;
+const double MAX_EDGE_LENGTH = 0.03;
 
 const bool TRACE_ITERATIONS   = false;
 const bool TRACE_WRITE_MESHES = false;
@@ -485,6 +504,7 @@ struct Config
              + (REMESH_ONLY ? "_frozen" : "")
              + weight_tag("mel", MAX_EDGE_LENGTH / 100.0)
              + (MAP_DRIVEN_TEL ? ("_mdtel" + weight_tag("floor", MAP_TEL_FLOOR)) : "")
+             + (RELEASE_LANDMARKS ? "_rellm" : "")
              + ((pair_mode == PairMode::Stretched && MOBIUS_FITTED_EMBEDDING_B
                  && !START_FROM_GROUND_TRUTH) ? "_mob" : "");
     }
@@ -996,6 +1016,10 @@ void run_config(
     TinyAD::Timer timer(name);
 
     landmark_phase(map_state);
+    // See RELEASE_LANDMARKS: off is this app's historical behaviour, on matches
+    // every upstream app.
+    if (RELEASE_LANDMARKS)
+        release_landmarks(map_state);
     report(map_state, name, "01_landmark", _csv);
 
     const bool prescribed = (_config.energy_mode == EnergyMode::PrescribedMetric);
@@ -1091,6 +1115,7 @@ void run()
             + std::string(REMESH_ONLY ? "_frozen" : "")
             + weight_tag("mel", MAX_EDGE_LENGTH / 100.0)
             + (MAP_DRIVEN_TEL ? ("_mdtel" + weight_tag("floor", MAP_TEL_FLOOR)) : "")
+            + std::string(RELEASE_LANDMARKS ? "_rellm" : "")
             + std::string(MOBIUS_FITTED_EMBEDDING_B ? "_mob" : "");
     std::ofstream csv(output_root / ("metrics_" + suffix + ".csv"));
     csv << "config,stage,corr_mean,corr_median,corr_max,"
