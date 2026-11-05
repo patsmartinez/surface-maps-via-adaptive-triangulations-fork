@@ -91,9 +91,9 @@ namespace SurfaceMaps
 ///            cone points and the developable regions give the energy soft modes.
 ///   u_shape: 5852 verts. Base stretched 2x in x, both arms translated +-0.65 rigidly,
 ///            transition at |x| ~ 0.65. 7.4x bigger, so runs are substantially slower.
-const std::string MESH_DIR = "meshes/sphere";
-const std::string MESH_A   = "sphere.obj";
-const std::string MESH_B   = "ellipse1.obj";
+const std::string MESH_DIR = "meshes/l_shape";
+const std::string MESH_A   = "newL.obj";
+const std::string MESH_B   = "stretchedL.obj";
 
 /// 8 / 16 / 32 swept. 16 was marginally best (corr 0.0062 vs 0.0074) and gave the widest
 /// prescribed-vs-dirichlet gap (4.6x); 32 degrades 2.3x and collapses the gap to 1.03x,
@@ -305,7 +305,7 @@ const bool PROBE_SYMMETRY     = false;
 /// duplicate the plain run's A-on-A rows exactly. Since the tel fix put them at
 /// 1e-11 they carry no information either. On a 52k-vertex input that is half the
 /// runtime for nothing.
-const bool STRETCHED_ONLY     = false;
+const bool STRETCHED_ONLY     = true;
 
 /// Multiply the coarse AND fine phases' target approximation error (0.01 / 0.001) by
 /// this factor, which is the ONLY clean way to move T's resolution while holding the
@@ -367,6 +367,16 @@ const bool REMESH_ONLY = false;
 const double MAX_EDGE_LENGTH = 0.03;
 
 const bool TRACE_ITERATIONS   = false;
+
+/// Also dump the lifted T on each input mesh, once per traced step, as
+///   <config>/trace/fNNNN_<kind>_{A,B}.obj
+/// Those are the animation frames. Render them with
+///   tools/render_trace.py <config_output_dir>
+/// which rasterizes them locally (numpy + Pillow) because the app's own screenshot path
+/// needs glow/OpenGL 4.2+ and cannot build on Apple Silicon. Verified read-only: with the
+/// trace on, the L released pair reproduces 0.0392886 / 0.00397053 exactly.
+///
+/// Costs disk: 402 frames x 2 meshes is 46 MB for the L at this config.
 const bool TRACE_WRITE_MESHES = false;
 /// Dump a mesh only every Nth traced step (the CSV always gets every step).
 const int  TRACE_MESH_STRIDE  = 1;
@@ -420,13 +430,21 @@ const double TEXTURE_FACTOR         = 4.0;
 enum class TexSource { Planar, Sphere, Triplanar };
 const TexSource TEXTURE_SOURCE = TexSource::Triplanar;
 
-/// Extra render showing the landmarks as world-space balls on each input mesh.
+/// Draw the landmarks as world-space balls INSIDE the two renders (wire and texture),
+/// not as a third render of their own -- see overlay_landmarks() in run(). The separate
+/// view_landmark_balls() render this used to call drew its own grey copy of each input
+/// mesh, so it could not be read against the wireframe or the checkers without flipping
+/// between two images -- which was the only reason to look at it.
 ///
 /// The larger ball is T's landmark lifted onto the mesh (where the map puts it), the
 /// smaller one is the landmark pinned on the input mesh (where it should be), same colour
 /// per landmark across the grid. The small one hides inside the large one when the
 /// constraint holds, so: one ball = satisfied, two balls = drift, and the gap is the
 /// error. Radius is relative to the bounding-box diagonal.
+///
+/// With RELEASE_LANDMARKS on there is no landmarks_T left to draw, so only the small
+/// reference balls appear. Still worth having: the same colour marks the same landmark on
+/// A and on B, so the correspondence is readable straight off the pair.
 const bool   LANDMARK_BALLS         = true;
 const double LANDMARK_RADIUS_FACTOR = 0.015;
 
@@ -1016,6 +1034,16 @@ void run_config(
     TinyAD::Timer timer(name);
 
     landmark_phase(map_state);
+
+    // Snapshot for the render only. release_landmarks() clears landmarks_T AND every
+    // landmarks_input[i], so with RELEASE_LANDMARKS on the final state has nothing left
+    // to draw and the landmark overlay would come out empty. Input vertex handles stay
+    // valid for the whole run (the input meshes are never remeshed), so these can be put
+    // back at the end. landmarks_T CANNOT be: those index mesh_T, which remeshing
+    // rewrites, and once released the landmark vertices lose their collapse protection
+    // (Remeshing.cc:298), so a stale handle can name a different vertex or none.
+    const std::vector<std::vector<VH>> landmarks_input_at_init = map_state.landmarks_input;
+
     // See RELEASE_LANDMARKS: off is this app's historical behaviour, on matches
     // every upstream app.
     if (RELEASE_LANDMARKS)
@@ -1079,6 +1107,10 @@ void run_config(
     std::vector<TriMesh> lifted_Ts = lifted_meshes_from_mapstate(map_state);
     for (int i = 0; i < (int)map_state.meshes_input.size(); ++i)
         write_mesh(lifted_Ts[i], output_dir / ("T_lifted_" + std::to_string(i) + ".obj"));
+
+    // Put the landmark positions back for the overlay (see landmarks_input_at_init).
+    // After every report() and every write, so nothing that was measured is touched.
+    map_state.landmarks_input = landmarks_input_at_init;
 
     _out_lifted_A.push_back(lifted_Ts[0]);
     _out_lifted_B.push_back(lifted_Ts[1]);
@@ -1159,28 +1191,62 @@ void run()
     // write it with write_colored_ply_flat().
     ISM_INFO("Headless build: skipping the 8 renders. CSV, trace and OBJs are written.");
 #else
-    // --- Visualization: 2 per config = 8 total ---------------------------
-    // Row 1: geometry + wireframe on B (does T look sane, do triangles slide?)
-    // Row 2: checkerboard transferred A -> B (sliding and shear are obvious here)
+    // --- Visualization: 2 renders per config = 8 total --------------------
+    // Render 1: geometry + T wireframe, A | B (does T look sane, do triangles slide?)
+    // Render 2: checkerboard transferred A -> B (sliding and shear are obvious here)
+    // Landmarks are drawn into BOTH, not as a render of their own -- see LANDMARK_BALLS.
+    //
+    // overlay_landmarks() and textured_view() add renderables to whichever gv::view() is
+    // currently open, so both have to be called from inside one.
+    auto overlay_landmarks = [&] (const MapState& _state, const TriMesh& _lifted_T_i, const int _mesh_idx)
+    {
+        if (!LANDMARK_BALLS)
+            return;
+
+        // Relative to the bounding box, so one factor works whatever the normalization.
+        const double radius = LANDMARK_RADIUS_FACTOR * bb_diag(_state.meshes_input[_mesh_idx]);
+
+        // Where the map currently puts each landmark: T's landmark vertex lifted onto the
+        // mesh. Drawn first and larger so an input landmark still agreeing with it hides
+        // inside it. Empty on a released run.
+        if (!_state.landmarks_T.empty())
+            view_landmarks(_lifted_T_i, _state.landmarks_T, WidthWorld(radius, true));
+
+        // Where it should be. view_landmarks walks a fresh ColorGenerator in the same
+        // order on every call, so landmark j is the same colour on A and on B.
+        if (_mesh_idx < (int)_state.landmarks_input.size())
+            view_landmarks(_state.meshes_input[_mesh_idx], _state.landmarks_input[_mesh_idx],
+                           WidthWorld(0.5f * radius, true));
+    };
+
+    // The TEXTURE_SOURCE switch, in one place instead of twice. See the TexSource enum
+    // for what the three schemes cost.
+    auto textured_view = [&] (const MapState& _state, const int _mesh_idx)
+    {
+        if (TEXTURE_SOURCE == TexSource::Triplanar)
+            view_texture_triplanar_input(_state, 0, _mesh_idx, TEXTURE_FACTOR, texture);
+        else if (TEXTURE_SOURCE == TexSource::Sphere)
+            view_texture_sphere_embedding_input(_state, 0, _mesh_idx, TEXTURE_FACTOR, texture);
+        else
+            view_texture_frontal_projection_input(_state, 0, _mesh_idx, TEXTURE_PROJECTION_DIR, TEXTURE_FACTOR, texture);
+    };
+
     for (int i = 0; i < (int)configs.size(); ++i)
     {
         const std::string name = configs[i].name();
+        const TriMesh* const lifted[2] = { &lifted_As[i], &lifted_Bs[i] };
 
         {
             auto s = screenshot_config(OPEN_VIEWER, screenshot_dir / (name + "_wire.png"), tg::ivec2(1920, 1080), true);
             auto style = default_style();
             auto g = gv::grid();
+            for (int m = 0; m < 2; ++m)
             {
                 auto v = gv::view();
-                view_mesh(states[i].meshes_input[0], Color(0.8, 0.8, 0.8, 0.5));
-                view_mesh(lifted_As[i], Color(1.0, 1.0, 1.0, 0.8));
-                view_wireframe(lifted_As[i], MAGENTA, WidthScreen(0.5));
-            }
-            {
-                auto v = gv::view();
-                view_mesh(states[i].meshes_input[1], Color(0.8, 0.8, 0.8, 0.5));
-                view_mesh(lifted_Bs[i], Color(1.0, 1.0, 1.0, 0.8));
-                view_wireframe(lifted_Bs[i], TEAL, WidthScreen(0.5));
+                view_mesh(states[i].meshes_input[m], Color(0.8, 0.8, 0.8, 0.5));
+                view_mesh(*lifted[m], Color(1.0, 1.0, 1.0, 0.8));
+                view_wireframe(*lifted[m], m == 0 ? MAGENTA : TEAL, WidthScreen(0.5));
+                overlay_landmarks(states[i], *lifted[m], m);
             }
         }
 
@@ -1188,31 +1254,12 @@ void run()
             auto s = screenshot_config(OPEN_VIEWER, screenshot_dir / (name + "_texture.png"), tg::ivec2(1920, 1080), true);
             auto style = default_style();
             auto g = gv::grid();
+            for (int m = 0; m < 2; ++m)
             {
                 auto v = gv::view();
-                if (TEXTURE_SOURCE == TexSource::Triplanar)
-                    view_texture_triplanar_input(states[i], 0, 0, TEXTURE_FACTOR, texture);
-                else if (TEXTURE_SOURCE == TexSource::Sphere)
-                    view_texture_sphere_embedding_input(states[i], 0, 0, TEXTURE_FACTOR, texture);
-                else
-                    view_texture_frontal_projection_input(states[i], 0, 0, TEXTURE_PROJECTION_DIR, TEXTURE_FACTOR, texture);
+                textured_view(states[i], m);
+                overlay_landmarks(states[i], *lifted[m], m);
             }
-            {
-                auto v = gv::view();
-                if (TEXTURE_SOURCE == TexSource::Triplanar)
-                    view_texture_triplanar_input(states[i], 0, 1, TEXTURE_FACTOR, texture);
-                else if (TEXTURE_SOURCE == TexSource::Sphere)
-                    view_texture_sphere_embedding_input(states[i], 0, 1, TEXTURE_FACTOR, texture);
-                else
-                    view_texture_frontal_projection_input(states[i], 0, 1, TEXTURE_PROJECTION_DIR, TEXTURE_FACTOR, texture);
-            }
-        }
-
-        if (LANDMARK_BALLS)
-        {
-            auto s = screenshot_config(OPEN_VIEWER, screenshot_dir / (name + "_landmarks.png"), tg::ivec2(1920, 1080), true);
-            auto style = default_style();
-            view_landmark_balls(states[i], LANDMARK_RADIUS_FACTOR, true);
         }
     }
 
