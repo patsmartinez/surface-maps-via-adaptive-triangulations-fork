@@ -149,8 +149,13 @@ class Camera:
 # --------------------------------------------------------------------------------------
 # Rasterizer
 # --------------------------------------------------------------------------------------
-def render_panel(V, F, cam, edge_color, edge_bias_frac=0.0015):
-    """Flat-shaded z-buffered surface with its own edges drawn on top, depth-tested."""
+def render_panel(V, F, cam, edge_color, edge_bias_frac=0.0015, face_rgb=None):
+    """Flat-shaded z-buffered surface with its own edges drawn on top, depth-tested.
+
+    face_rgb: optional (n_faces, 3) array in [0,1]. Shading is still applied, so a
+    coloured field keeps its relief instead of reading as a flat decal. Pass
+    edge_color=None to omit the wireframe, which a dense field mesh usually wants.
+    """
     h, w = cam.h, cam.w
     img = np.empty((h, w, 3), dtype=np.float32)
     img[:] = np.asarray(BG, dtype=np.float32) / 255.0
@@ -170,7 +175,7 @@ def render_panel(V, F, cam, edge_color, edge_bias_frac=0.0015):
     shade = 0.45 + 0.55 * np.abs(n @ light)
 
     x, y = P[:, 0], P[:, 1]
-    base = SURFACE.astype(np.float32)
+    base = SURFACE.astype(np.float32) if face_rgb is None else np.asarray(face_rgb, np.float32)
     for i in range(len(F)):
         a, b, c = F[i]
         x0, y0, x1, y1, x2, y2 = x[a], y[a], x[b], y[b], x[c], y[c]
@@ -197,11 +202,13 @@ def render_panel(V, F, cam, edge_color, edge_bias_frac=0.0015):
         if not upd.any():
             continue
         zsub[upd] = dd[upd]
-        img[ymin:ymax + 1, xmin:xmax + 1][upd] = base * shade[i]
+        col = base if face_rgb is None else base[i]
+        img[ymin:ymax + 1, xmin:xmax + 1][upd] = col * shade[i]
 
     img = (np.clip(img, 0, 1) * 255).astype(np.uint8)
-    _draw_edges(img, zbuf, P, D, unique_edges(F), edge_color,
-                bias=edge_bias_frac * cam.diag)
+    if edge_color is not None:
+        _draw_edges(img, zbuf, P, D, unique_edges(F), edge_color,
+                    bias=edge_bias_frac * cam.diag)
     return img
 
 

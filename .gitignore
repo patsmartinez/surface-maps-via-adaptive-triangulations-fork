@@ -8,3 +8,4 @@ apps/adaptive_triangulations/__pycache__
 build-headless
 build-viewer-check
 .DS_Store
+.venv

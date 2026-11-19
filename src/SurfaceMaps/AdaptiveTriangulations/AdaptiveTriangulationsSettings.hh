@@ -9,10 +9,18 @@
 #pragma once
 
 #include <SurfaceMaps/Types.hh>
+#include <SurfaceMaps/Utils/Filesystem.hh>
 #include <SurfaceMaps/AdaptiveTriangulations/Helpers.hh>
 
 namespace SurfaceMaps
 {
+
+/// How map_driven_target_edge_lengths turns the detected seam into a sizing field.
+enum class MapTelMethod
+{
+    HeatDiffusion,
+    GeodesicDijkstra,
+};
 
 struct AdaptiveTriangulationsSettings
 {
@@ -108,16 +116,54 @@ struct AdaptiveTriangulationsSettings
     /// than that only resolves the seam's position, not its values.
     double map_tel_floor = 0.015;
 
-    /// Gradation: tel grows as floor + g * distance-to-seam. A size-per-length, so it is
-    /// independent of input mesh resolution. 0.2-1.0 is the usual meshing range; the cost
-    /// is nearly flat in g (3-12% of face count from 0.25 to infinity), so there is no
-    /// reason to tune it.
+    /// How the seam is turned into a field. See map_driven_target_edge_lengths.
+    ///
+    /// HeatDiffusion (default): one short-time implicit heat step from the seam, band
+    ///   width set by map_tel_diffusion_length. Smooth, and its thickness is a LENGTH, so
+    ///   it does not change meaning when the input mesh is refined.
+    /// GeodesicDijkstra: the original. tel = floor + gradation * dist(seam), with the
+    ///   seam first dilated by map_tel_min_rings. Kept so the earlier measurements stay
+    ///   reproducible; map_tel_gradation and map_tel_min_rings apply only to this path.
+    MapTelMethod map_tel_method = MapTelMethod::HeatDiffusion;
+
+    /// HeatDiffusion only. The diffusion LENGTH w; the solver runs one implicit step at
+    /// t = w^2, so w is the distance over which the field falls off, in world units on
+    /// mesh A. This is the knob that replaces map_tel_min_rings: a ring count is a
+    /// resolution-dependent way of saying "thick enough to be sampled", while w says it
+    /// in units that survive a refinement of the input.
+    ///
+    /// 0 means auto = max(2 * map_tel_floor, mesh A's mean edge): the transition spans
+    /// about two of the elements the field is asking for, but never less than one input
+    /// element, which is the finest thing the diffusion can represent.
+    ///
+    /// Measured on the L, band as a fraction of A's area: 2*h = 0.089 -> 39.6%,
+    /// w = 0.03 -> 19.1%, w = 0.015 -> 18.4%, and the old dilate-then-Dijkstra path
+    /// -> 45.4%. Note the saturation: below w ~ 0.03 the knob stops doing anything,
+    /// because what is left is the DETECTOR's own footprint (125 of the L's 786 vertices
+    /// are seam, pinned to the floor). On a shape whose prescription jumps across a sharp
+    /// curve rather than the L's 101-face transition band, that floor is far lower and w
+    /// controls the width throughout.
+    double map_tel_diffusion_length = 0.0;
+
+    /// GeodesicDijkstra only. Gradation: tel grows as floor + g * distance-to-seam. A
+    /// size-per-length, so it is independent of input mesh resolution. 0.2-1.0 is the
+    /// usual meshing range; the cost is nearly flat in g (3-12% of face count from 0.25
+    /// to infinity), so there is no reason to tune it.
     double map_tel_gradation = 0.5;
 
-    /// Rings the seam is dilated by before the gradation starts. Needed because tel is
-    /// read by a single centroid sample per T triangle, so a band thinner than an element
-    /// is invisible to it. 2 is the safe default; 1 is marginal on a mesh as fine as the U.
+    /// GeodesicDijkstra only. Rings the seam is dilated by before the gradation starts.
+    /// Needed because tel is read by a single centroid sample per T triangle, so a band
+    /// thinner than an element is invisible to it. 2 is the safe default; 1 is marginal
+    /// on a mesh as fine as the U. The HeatDiffusion path does not dilate -- the
+    /// diffusion itself is what widens the seam, which is the point of it.
     int map_tel_min_rings = 2;
+
+    /// Where to dump the three map-driven diagnostic PLYs (jump detector, diffused phi,
+    /// resulting sizing field) on mesh A. Empty disables them. Written with
+    /// write_vertex_field_ply, so no GL context is needed and they open in any mesh
+    /// viewer -- which is the point: on anything more complex than the test shapes,
+    /// "did the band land where I meant" is not answerable from the face count alone.
+    fs::path map_tel_debug_dir = "";
 
     /// Jump magnitude above which an edge counts as seam, in log-singular-value units.
     /// Well separated in practice: the L's seam doubles sigma_max, i.e. log 2 = 0.69,

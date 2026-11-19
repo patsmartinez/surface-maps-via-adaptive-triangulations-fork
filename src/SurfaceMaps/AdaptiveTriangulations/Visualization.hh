@@ -112,6 +112,19 @@ void view_texture_triplanar_input(
         const glow::SharedTexture2D& _texture);
 
 /// Show texture mapped to target mesh
+/// Show a per-vertex scalar field (a sizing field, the diffused phi, the raw jump) on an
+/// input mesh, coloured MAGENTA at _min through WHITE at _max. Per-face value is the mean
+/// of the face's three vertices, matching write_vertex_field_ply and matching what
+/// ideal_triangle_edge_length's centroid sample actually interpolates. Non-finite entries
+/// (the INF_DOUBLE that means "outside the band") are drawn at _max.
+///
+/// _min == _max == 0 auto-ranges from the data.
+void view_vertex_field(
+        const TriMesh& _mesh,
+        const ExternalProperty<VH, double>& _values,
+        const double _min = 0.0,
+        const double _max = 0.0);
+
 void view_texture_frontal_projection_input(
         const MapState& _map_state,
         const int _source_mesh_idx,

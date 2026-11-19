@@ -9,8 +9,10 @@
 #pragma once
 
 #include <SurfaceMaps/Types.hh>
+#include <SurfaceMaps/Utils/Filesystem.hh>
 #include <SurfaceMaps/AdaptiveTriangulations/MapState.hh>
 #include <SurfaceMaps/AdaptiveTriangulations/LiftToSurface.hh>
+#include <SurfaceMaps/AdaptiveTriangulations/AdaptiveTriangulationsSettings.hh>
 #include <SurfaceMaps/Utils/BSPTree.hh>
 
 namespace SurfaceMaps
@@ -71,9 +73,38 @@ ExternalProperty<VH, double> map_driven_target_edge_lengths(
         const ExternalProperty<FH, PrescribedJacobian>& _prescribed,
         const double _jump_threshold,
         const double _floor,
+        const double _far_tel,
+        const MapTelMethod _method,
+        const double _diffusion_length,
         const double _gradation,
         const int _min_rings,
-        int& _out_n_seam_verts);
+        int& _out_n_seam_verts,
+        ExternalProperty<VH, double>* _out_jump = nullptr,
+        ExternalProperty<VH, double>* _out_phi = nullptr);
+
+/// The diffusion length used when map_tel_diffusion_length is 0. Public so the caller can
+/// report the value it actually ran with instead of recomputing the rule and drifting.
+double map_tel_auto_diffusion_length(
+        const TriMesh& _mesh_A,
+        const double _floor);
+
+/// Mean edge length of a mesh.
+double mean_edge_length(
+        const TriMesh& _mesh);
+
+/// Dump a per-vertex sizing field as a flat-shaded colored PLY, openable in any mesh
+/// viewer with no GL context. Per face the value is the MEAN of its three vertices,
+/// which is exactly what ideal_triangle_edge_length's centroid sample interpolates, so
+/// the picture shows what the optimizer reads rather than what the field holds.
+///
+/// _min/_max both 0 means auto-range from the data. Low = MAGENTA (refine here),
+/// high = WHITE (leave alone). INF_DOUBLE entries are drawn at _max.
+void write_vertex_field_ply(
+        const TriMesh& _mesh,
+        const ExternalProperty<VH, double>& _values,
+        const fs::path& _path,
+        const double _min = 0.0,
+        const double _max = 0.0);
 
 /// Pick target edge length for single vertex of T (for one _mesh_input)
 template <typename T>

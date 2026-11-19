@@ -15,6 +15,7 @@
 #include <SurfaceMaps/AdaptiveTriangulations/DistortionHeatmap.hh>
 #include <SurfaceMaps/AdaptiveTriangulations/LiftToSurface.hh>
 #include <SurfaceMaps/Viewer/ColorGenerator.hh>
+#include <SurfaceMaps/Viewer/HeatmapColors.hh>
 #include <SurfaceMaps/Utils/IO.hh>
 #include <glow-extras/viewer/canvas.hh>
 
@@ -615,6 +616,57 @@ void view_landmarks_on_spheres(
             view_landmarks(_map_state.mesh_T, _map_state.embeddings_T[i], _map_state.landmarks_T, point_style);
         }
     }
+}
+
+
+void view_vertex_field(
+        const TriMesh& _mesh,
+        const ExternalProperty<VH, double>& _values,
+        const double _min,
+        const double _max)
+{
+    ExternalProperty<FH, double> per_face(_mesh, 0.0);
+    double lo = INF_DOUBLE;
+    double hi = -INF_DOUBLE;
+    for (auto fh : _mesh.faces())
+    {
+        VH vh_a, vh_b, vh_c;
+        handles(_mesh, fh, vh_a, vh_b, vh_c);
+        double sum = 0.0;
+        int n_finite = 0;
+        for (const VH vh : { vh_a, vh_b, vh_c })
+        {
+            if (std::isfinite(_values[vh]))
+            {
+                sum += _values[vh];
+                ++n_finite;
+            }
+        }
+        per_face[fh] = n_finite > 0 ? sum / n_finite : INF_DOUBLE;
+        if (std::isfinite(per_face[fh]))
+        {
+            lo = std::min(lo, per_face[fh]);
+            hi = std::max(hi, per_face[fh]);
+        }
+    }
+
+    double vmin = _min;
+    double vmax = _max;
+    if (vmin == 0.0 && vmax == 0.0)
+    {
+        vmin = std::isfinite(lo) ? lo : 0.0;
+        vmax = std::isfinite(hi) ? hi : 1.0;
+    }
+    if (vmax <= vmin)
+        vmax = vmin + 1.0;
+
+    for (auto fh : _mesh.faces())
+    {
+        if (!std::isfinite(per_face[fh]))
+            per_face[fh] = vmax;
+    }
+
+    view_face_colors(_mesh, linear_colors(per_face, vmin, vmax, MAGENTA, WHITE));
 }
 
 }

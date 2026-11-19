@@ -78,10 +78,18 @@ void init_target_edge_lengths(
         ISM_ASSERT(_settings.mesh_tel_passive); // see settings.map_driven_tel
 
         int n_seam_verts = 0;
+        ExternalProperty<VH, double> jump_field;
+        ExternalProperty<VH, double> phi_field;
+        // The far value is mesh 0's own curvature cap. factor_A_to_i_area[0] is exactly
+        // 1, so this is settings.max_edge_length unscaled -- the two fields then agree
+        // exactly outside the band and the min() is provably neutral there.
         const auto tel_map = map_driven_target_edge_lengths(
                     _map_state.meshes_input[0], _map_state.prescribed_jacobians[0],
                     _settings.map_tel_jump_thresh, _settings.map_tel_floor,
-                    _settings.map_tel_gradation, _settings.map_tel_min_rings, n_seam_verts);
+                    _settings.max_edge_length,
+                    _settings.map_tel_method, _settings.map_tel_diffusion_length,
+                    _settings.map_tel_gradation, _settings.map_tel_min_rings,
+                    n_seam_verts, &jump_field, &phi_field);
 
         int n_lowered = 0;
         for (auto vh : _map_state.meshes_input[0].vertices())
@@ -93,11 +101,58 @@ void init_target_edge_lengths(
             }
         }
 
+        // Area fraction of mesh A that the field drives genuinely fine, using the same
+        // "< 1.5 x floor" rule the app's n_band_T uses on T. This, not n_lowered, is the
+        // band: n_lowered counts a vertex nudged from 0.0300 to 0.0299 the same as one
+        // taken to the floor.
+        double band_area = 0.0;
+        double total_a = 0.0;
+        for (auto fh : _map_state.meshes_input[0].faces())
+        {
+            VH vh_a, vh_b, vh_c;
+            handles(_map_state.meshes_input[0], fh, vh_a, vh_b, vh_c);
+            const Vec3d& p_a = _map_state.meshes_input[0].point(vh_a);
+            const double a = 0.5 * (_map_state.meshes_input[0].point(vh_b) - p_a)
+                                   .cross(_map_state.meshes_input[0].point(vh_c) - p_a).norm();
+            total_a += a;
+            const double tel_f = (_map_state.tels_input[0][vh_a] + _map_state.tels_input[0][vh_b]
+                                  + _map_state.tels_input[0][vh_c]) / 3.0;
+            if (tel_f < 1.5 * _settings.map_tel_floor)
+                band_area += a;
+        }
+
+        const bool heat = (_settings.map_tel_method == MapTelMethod::HeatDiffusion);
         ISM_INFO("Map-driven tel: " << n_seam_verts << " seam vertices, "
                  << n_lowered << " of " << _map_state.meshes_input[0].n_vertices()
                  << " tels lowered (floor " << _settings.map_tel_floor
-                 << ", g " << _settings.map_tel_gradation
-                 << ", " << _settings.map_tel_min_rings << " rings)");
+                 << (heat
+                     ? (", heat diffusion, w "
+                        + std::to_string(_settings.map_tel_diffusion_length > 0.0
+                                         ? _settings.map_tel_diffusion_length
+                                         : map_tel_auto_diffusion_length(
+                                               _map_state.meshes_input[0],
+                                               _settings.map_tel_floor))
+                        + (_settings.map_tel_diffusion_length > 0.0 ? "" : " (auto)"))
+                     : (", dijkstra, g " + std::to_string(_settings.map_tel_gradation)
+                        + ", " + std::to_string(_settings.map_tel_min_rings) + " rings"))
+                 << "), band " << (total_a > 0.0 ? 100.0 * band_area / total_a : 0.0)
+                 << "% of A's area");
+
+        // Diagnostic dumps. Headless-safe (no GL), and the only way to see the field on
+        // a shape where "does the band sit where I think" is not obvious by eye.
+        if (!_settings.map_tel_debug_dir.empty())
+        {
+            const fs::path& dir = _settings.map_tel_debug_dir;
+            fs::create_directories(dir);
+            const TriMesh& mesh_A = _map_state.meshes_input[0];
+            // Fixed range on the jump so runs stay comparable; auto on the other two.
+            write_vertex_field_ply(mesh_A, jump_field, dir / "tel_01_jump.ply", 0.0,
+                                   _settings.map_tel_jump_thresh * 4.0);
+            if (heat)
+                write_vertex_field_ply(mesh_A, phi_field, dir / "tel_02_phi.ply", 0.0, 1.0);
+            write_vertex_field_ply(mesh_A, _map_state.tels_input[0], dir / "tel_03_sizing.ply",
+                                   _settings.map_tel_floor, _settings.max_edge_length);
+        }
 
         if (n_seam_verts == 0)
             ISM_WARNING("Map-driven tel found no seam: the prescribed field varies less than map_tel_jump_thresh everywhere, so this is a no-op.");

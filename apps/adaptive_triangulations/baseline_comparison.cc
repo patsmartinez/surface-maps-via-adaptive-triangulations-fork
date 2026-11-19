@@ -458,8 +458,26 @@ const double LANDMARK_RADIUS_FACTOR = 0.015;
 /// signal, down-weighted 100x, which may not be enough to fire any split. Check
 /// n_band_T in the CSV before concluding anything -- if it does not move, the field was
 /// outvoted rather than wrong, and the thing to change is W_MESH, not the floor.
-const bool   MAP_DRIVEN_TEL    = false;
+const bool   MAP_DRIVEN_TEL    = true;
 const double MAP_TEL_FLOOR     = 0.015;
+
+/// How the detected seam becomes a field. HeatDiffusion is the default: one short-time
+/// implicit heat step, band width set by MAP_TEL_DIFFUSION_LENGTH below. GeodesicDijkstra
+/// is the original dilate-then-Dijkstra path, kept so the earlier numbers reproduce;
+/// MAP_TEL_GRADATION and MAP_TEL_MIN_RINGS apply only to it.
+const MapTelMethod MAP_TEL_METHOD = MapTelMethod::HeatDiffusion;
+
+/// Diffusion length w, in world units on mesh A (t = w^2). 0 = auto, 2x mesh A's mean
+/// edge length. Mesh A's mean edge is 0.0447 on the L and ~0.0149 on the U, so auto is
+/// ~0.089 and ~0.030 -- set it explicitly to make the band mean the same physical
+/// thickness on both.
+const double MAP_TEL_DIFFUSION_LENGTH = 0.0;
+
+/// Write tel_01_jump / tel_02_phi / tel_03_sizing PLYs per config. Headless-safe; render
+/// them with tools/render_field.py. The field is identical in both phases, so the coarse
+/// phase's dump is simply overwritten by the fine phase's.
+const bool   MAP_TEL_DEBUG_PLY = true;
+
 const double MAP_TEL_GRADATION = 0.5;
 const int    MAP_TEL_MIN_RINGS = 2;
 
@@ -1063,8 +1081,12 @@ void run_config(
         settings.mesh_tel_passive = MESH_TEL_PASSIVE;
         settings.map_driven_tel = MAP_DRIVEN_TEL;
         settings.map_tel_floor = MAP_TEL_FLOOR;
+        settings.map_tel_method = MAP_TEL_METHOD;
+        settings.map_tel_diffusion_length = MAP_TEL_DIFFUSION_LENGTH;
         settings.map_tel_gradation = MAP_TEL_GRADATION;
         settings.map_tel_min_rings = MAP_TEL_MIN_RINGS;
+        if (MAP_TEL_DEBUG_PLY)
+            settings.map_tel_debug_dir = output_dir / "sizing_field";
         settings.approx_error *= APPROX_ERROR_SCALE;
         settings.remesh_only = REMESH_ONLY;
         settings.max_edge_length = std::min(settings.max_edge_length, MAX_EDGE_LENGTH);
@@ -1085,8 +1107,12 @@ void run_config(
         settings.mesh_tel_passive = MESH_TEL_PASSIVE;
         settings.map_driven_tel = MAP_DRIVEN_TEL;
         settings.map_tel_floor = MAP_TEL_FLOOR;
+        settings.map_tel_method = MAP_TEL_METHOD;
+        settings.map_tel_diffusion_length = MAP_TEL_DIFFUSION_LENGTH;
         settings.map_tel_gradation = MAP_TEL_GRADATION;
         settings.map_tel_min_rings = MAP_TEL_MIN_RINGS;
+        if (MAP_TEL_DEBUG_PLY)
+            settings.map_tel_debug_dir = output_dir / "sizing_field";
         settings.approx_error *= APPROX_ERROR_SCALE;
         settings.remesh_only = REMESH_ONLY;
         settings.max_edge_length = std::min(settings.max_edge_length, MAX_EDGE_LENGTH);
