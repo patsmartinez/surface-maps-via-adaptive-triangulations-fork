@@ -87,8 +87,7 @@ void init_target_edge_lengths(
                     _map_state.meshes_input[0], _map_state.prescribed_jacobians[0],
                     _settings.map_tel_jump_thresh, _settings.map_tel_floor,
                     _settings.max_edge_length,
-                    _settings.map_tel_method, _settings.map_tel_diffusion_length,
-                    _settings.map_tel_gradation, _settings.map_tel_min_rings,
+                    _settings.map_tel_diffusion_length,
                     n_seam_verts, &jump_field, &phi_field);
 
         int n_lowered = 0;
@@ -121,20 +120,14 @@ void init_target_edge_lengths(
                 band_area += a;
         }
 
-        const bool heat = (_settings.map_tel_method == MapTelMethod::HeatDiffusion);
         ISM_INFO("Map-driven tel: " << n_seam_verts << " seam vertices, "
                  << n_lowered << " of " << _map_state.meshes_input[0].n_vertices()
-                 << " tels lowered (floor " << _settings.map_tel_floor
-                 << (heat
-                     ? (", heat diffusion, w "
-                        + std::to_string(_settings.map_tel_diffusion_length > 0.0
-                                         ? _settings.map_tel_diffusion_length
-                                         : map_tel_auto_diffusion_length(
-                                               _map_state.meshes_input[0],
-                                               _settings.map_tel_floor))
-                        + (_settings.map_tel_diffusion_length > 0.0 ? "" : " (auto)"))
-                     : (", dijkstra, g " + std::to_string(_settings.map_tel_gradation)
-                        + ", " + std::to_string(_settings.map_tel_min_rings) + " rings"))
+                 << " tels lowered (floor " << _settings.map_tel_floor << ", w "
+                 << (_settings.map_tel_diffusion_length > 0.0
+                     ? _settings.map_tel_diffusion_length
+                     : map_tel_auto_diffusion_length(_map_state.meshes_input[0],
+                                                     _settings.map_tel_floor))
+                 << (_settings.map_tel_diffusion_length > 0.0 ? "" : " (auto)")
                  << "), band " << (total_a > 0.0 ? 100.0 * band_area / total_a : 0.0)
                  << "% of A's area");
 
@@ -148,8 +141,7 @@ void init_target_edge_lengths(
             // Fixed range on the jump so runs stay comparable; auto on the other two.
             write_vertex_field_ply(mesh_A, jump_field, dir / "tel_01_jump.ply", 0.0,
                                    _settings.map_tel_jump_thresh * 4.0);
-            if (heat)
-                write_vertex_field_ply(mesh_A, phi_field, dir / "tel_02_phi.ply", 0.0, 1.0);
+            write_vertex_field_ply(mesh_A, phi_field, dir / "tel_02_phi.ply", 0.0, 1.0);
             write_vertex_field_ply(mesh_A, _map_state.tels_input[0], dir / "tel_03_sizing.ply",
                                    _settings.map_tel_floor, _settings.max_edge_length);
         }

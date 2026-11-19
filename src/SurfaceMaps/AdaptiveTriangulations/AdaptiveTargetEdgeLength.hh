@@ -74,10 +74,7 @@ ExternalProperty<VH, double> map_driven_target_edge_lengths(
         const double _jump_threshold,
         const double _floor,
         const double _far_tel,
-        const MapTelMethod _method,
         const double _diffusion_length,
-        const double _gradation,
-        const int _min_rings,
         int& _out_n_seam_verts,
         ExternalProperty<VH, double>* _out_jump = nullptr,
         ExternalProperty<VH, double>* _out_phi = nullptr);

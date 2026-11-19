@@ -102,71 +102,6 @@ template TinyAD::Double<12,false> map_energy(const Vec3<TinyAD::Double<12,false>
 template TinyAD::Double<12,true> map_energy(const Vec3<TinyAD::Double<12,true>>&, const Vec3<TinyAD::Double<12,true>>&, const Vec3<TinyAD::Double<12,true>>&,
         const Vec3<TinyAD::Double<12,true>>&, const Vec3<TinyAD::Double<12,true>>&, const Vec3<TinyAD::Double<12,true>>&);
 
-/// Prescribed Jacobian map energy - penalizes deviation from target Jacobian J*
-/// Computes symmetric Dirichlet energy on the residual Jacobian: J_residual = J * J*^{-1}
-template <typename T>
-T map_energy_prescribed(
-        const Vec3<T>& _a_lifted_A,
-        const Vec3<T>& _b_lifted_A,
-        const Vec3<T>& _c_lifted_A,
-        const Vec3<T>& _a_lifted_B,
-        const Vec3<T>& _b_lifted_B,
-        const Vec3<T>& _c_lifted_B,
-        const Eigen::Matrix2<T>& _J_star)
-{
-    // Compute local 2D coordinate systems for lifted T triangles
-    Vec2<T> a_lifted_local_A, b_lifted_local_A, c_lifted_local_A, a_lifted_local_B, b_lifted_local_B, c_lifted_local_B;
-    to_local_coordinates(_a_lifted_A, _b_lifted_A, _c_lifted_A, a_lifted_local_A, b_lifted_local_A, c_lifted_local_A);
-    to_local_coordinates(_a_lifted_B, _b_lifted_B, _c_lifted_B, a_lifted_local_B, b_lifted_local_B, c_lifted_local_B);
-
-    // Matrices with edge vectors as columns
-    Eigen::Matrix2<T> M_A;
-    Eigen::Matrix2<T> M_B;
-    M_A << b_lifted_local_A - a_lifted_local_A, c_lifted_local_A - a_lifted_local_A;
-    M_B << b_lifted_local_B - a_lifted_local_B, c_lifted_local_B - a_lifted_local_B;
-
-    // Compute areas of lifted triangles
-    const T area_lifted_A = 0.5 * M_A.determinant();
-    const T area_lifted_B = 0.5 * M_B.determinant();
-
-    // Don't allow degenerate or inverted triangles
-    // For inverted triangles, delegate to standard map_energy behavior
-    if (area_lifted_A <= 0 || area_lifted_B <= 0)
-        return INFINITY;
-
-    // Check for degenerate J* - use a small threshold for numerical stability
-    T det_J_star = _J_star.determinant();
-    if (det_J_star <= T(1e-10))
-    {
-        // Fall back to standard map energy (J* = I)
-        Eigen::Matrix2<T> J = M_B * M_A.inverse();
-        Eigen::Matrix2<T> J_inv = M_A * M_B.inverse();
-        return area_lifted_B * J.squaredNorm() + area_lifted_A * J_inv.squaredNorm();
-    }
-
-    // Compute actual Jacobian J = M_B * M_A^{-1}
-    Eigen::Matrix2<T> J = M_B * M_A.inverse();
-
-    // Compute residual Jacobian: J_residual = J * J*^{-1}
-    // When J = J*, J_residual = I (identity)
-    Eigen::Matrix2<T> J_star_inv = _J_star.inverse();
-    Eigen::Matrix2<T> J_residual = J * J_star_inv;
-
-    // Compute inverse residual: J_residual^{-1} = J* * J^{-1} = J* * M_A * M_B^{-1}
-    Eigen::Matrix2<T> J_residual_inv = _J_star * M_A * M_B.inverse();
-
-    // Symmetric Dirichlet on residual
-    // Note: minimum is at J_residual = I, where ||I||^2_F = 2
-    return area_lifted_B * J_residual.squaredNorm() + area_lifted_A * J_residual_inv.squaredNorm();
-}
-
-template double map_energy_prescribed(const Vec3<double>&, const Vec3<double>&, const Vec3<double>&,
-        const Vec3<double>&, const Vec3<double>&, const Vec3<double>&, const Eigen::Matrix2<double>&);
-template TinyAD::Double<12,false> map_energy_prescribed(const Vec3<TinyAD::Double<12,false>>&, const Vec3<TinyAD::Double<12,false>>&, const Vec3<TinyAD::Double<12,false>>&,
-        const Vec3<TinyAD::Double<12,false>>&, const Vec3<TinyAD::Double<12,false>>&, const Vec3<TinyAD::Double<12,false>>&, const Eigen::Matrix2<TinyAD::Double<12,false>>&);
-template TinyAD::Double<12,true> map_energy_prescribed(const Vec3<TinyAD::Double<12,true>>&, const Vec3<TinyAD::Double<12,true>>&, const Vec3<TinyAD::Double<12,true>>&,
-        const Vec3<TinyAD::Double<12,true>>&, const Vec3<TinyAD::Double<12,true>>&, const Vec3<TinyAD::Double<12,true>>&, const Eigen::Matrix2<TinyAD::Double<12,true>>&);
-
 /// Metric form of the prescribed Jacobian map energy.
 /// Prescribes only the pullback metric M* = V * Sigma^2 * V^T; the left singular vectors U
 /// never enter (Frobenius norms are invariant to rotations), so no projection onto mesh B is needed.
@@ -506,32 +441,16 @@ T eval_trianglepair_energy_triangle_T(
             }
             ISM_ASSERT_GEQ(pair_idx, 0);
 
-            if (_settings.prescribed_metric_form)
-            {
-                // Metric form: only V and sigma are needed, U is irrelevant to the energy
-                Eigen::Matrix2<T> V_local;
-                Eigen::Vector2d sigma;
-                lookup_prescribed_metric(
-                    _a_sphere_A, _b_sphere_A, _c_sphere_A,
-                    a_lifted_A, b_lifted_A, c_lifted_A,
-                    pair_idx, _map_state, V_local, sigma);
+            // Metric form: only V and sigma are needed, U is irrelevant to the energy.
+            Eigen::Matrix2<T> V_local;
+            Eigen::Vector2d sigma;
+            lookup_prescribed_metric(
+                _a_sphere_A, _b_sphere_A, _c_sphere_A,
+                a_lifted_A, b_lifted_A, c_lifted_A,
+                pair_idx, _map_state, V_local, sigma);
 
-                E_map += map_energy_prescribed_metric(a_lifted_A, b_lifted_A, c_lifted_A,
-                                                      a_lifted_B, b_lifted_B, c_lifted_B, V_local, sigma);
-            }
-            else
-            {
-                // Look up the prescribed Jacobian for this T-triangle
-                Eigen::Matrix2<T> J_star = lookup_prescribed_jacobian(
-                    _a_sphere_A, _b_sphere_A, _c_sphere_A,
-                    a_lifted_A, b_lifted_A, c_lifted_A,
-                    a_lifted_B, b_lifted_B, c_lifted_B,
-                    pair_idx, _map_state);
-
-                // Compute prescribed map energy
-                E_map += map_energy_prescribed(a_lifted_A, b_lifted_A, c_lifted_A,
-                                               a_lifted_B, b_lifted_B, c_lifted_B, J_star);
-            }
+            E_map += map_energy_prescribed_metric(a_lifted_A, b_lifted_A, c_lifted_A,
+                                                  a_lifted_B, b_lifted_B, c_lifted_B, V_local, sigma);
         }
         else
         {
@@ -551,86 +470,6 @@ template TinyAD::Double<12, false> eval_trianglepair_energy_triangle_T(const Vec
 template TinyAD::Double<12, true> eval_trianglepair_energy_triangle_T(const Vec3<TinyAD::Double<12, true>>&, const Vec3<TinyAD::Double<12, true>>&, const Vec3<TinyAD::Double<12, true>>&, const Vec3<TinyAD::Double<12, true>>&, const Vec3<TinyAD::Double<12, true>>&, const Vec3<TinyAD::Double<12, true>>&, const int&, const int&, const MapState&, const AdaptiveTriangulationsSettings&);
 
 
-int prescribed_pair_for_B_mesh(
-        const MapState& _map_state,
-        const AdaptiveTriangulationsSettings& _settings,
-        const int _mesh_idx)
-{
-    if (!_settings.prescribed_mesh_ideal || !_settings.use_prescribed_jacobian)
-        return -1;
-    if (_map_state.prescribed_jacobians.empty())
-        return -1;
-
-    // Only the B side of a prescribed pair gets a deformed ideal. The prescription is
-    // "what A's triangle is supposed to become", so A's own ideal stays equilateral and
-    // the anisotropy is carried entirely on the B side.
-    for (int i = 0; i < (int)_map_state.pairs_map_distortion.size(); ++i)
-    {
-        if (_map_state.pairs_map_distortion[i].second == _mesh_idx)
-            return (i < (int)_map_state.prescribed_jacobians.size()) ? i : -1;
-    }
-    return -1;
-}
-
-Eigen::Matrix2d prescribed_ideal_shape(
-        const Vec3d& _a_sphere_A,
-        const Vec3d& _b_sphere_A,
-        const Vec3d& _c_sphere_A,
-        const int _pair_idx,
-        const MapState& _map_state)
-{
-    const int mesh_A_idx = _map_state.pairs_map_distortion[_pair_idx].first;
-
-    auto lift = [&] (const Vec3d& _p)
-    {
-        return lift_vertex_to_surface(_p, _map_state.meshes_input[mesh_A_idx],
-            _map_state.meshes_embeddings_input[mesh_A_idx], _map_state.bsp_embeddings_input[mesh_A_idx]);
-    };
-
-    const Vec3d a_lifted_A = lift(_a_sphere_A);
-    const Vec3d b_lifted_A = lift(_b_sphere_A);
-    const Vec3d c_lifted_A = lift(_c_sphere_A);
-
-    Eigen::Matrix2d V_local;
-    Eigen::Vector2d sigma;
-    lookup_prescribed_metric(_a_sphere_A, _b_sphere_A, _c_sphere_A,
-                             a_lifted_A, b_lifted_A, c_lifted_A,
-                             _pair_idx, _map_state, V_local, sigma);
-
-    if (sigma.minCoeff() <= 1e-6)
-        return Eigen::Matrix2d::Identity();
-
-    // The prescribed pullback metric is M* = V Sigma^2 V^T. Split off its determinant:
-    //
-    //     M*_hat = M* / sqrt(det M*) = V diag(s0/s1, s1/s0) V^T,   det M*_hat = 1
-    //
-    // and return its square root S = V diag(sqrt(s0/s1), sqrt(s1/s0)) V^T, so that
-    // det S = 1 exactly. Applying S to the ideal triangle's edge vectors gives a triangle
-    // whose Gram matrix is E^T M*_hat E -- i.e. precisely the prescribed edge lengths --
-    // with the SAME AREA as the equilateral it replaced.
-    //
-    // Area is excluded on purpose. det(J*) is part of the prescription, but T's triangle
-    // SIZE is the sizing field's job (`tel`, taken as the min over meshes). Letting
-    // det(J*) into the ideal would couple resolution control to the prescription and
-    // drive runaway refinement wherever the field stretches.
-    //
-    // No left singular vectors U are needed, and no ordering of sigma is assumed:
-    // V diag(.) V^T is just a spectral decomposition. At s0 == s1 this is V I V^T = I up
-    // to rounding, so an isotropic prescription recovers the equilateral ideal.
-    const double r = sigma[0] / sigma[1];
-
-    // An ISOTROPIC prescription must give back the equilateral ideal EXACTLY. Taking the
-    // general branch would return V V^T, which is identity only to the rounding in the
-    // Gram-Schmidt that built V_local -- and a ~1e-16 perturbation is enough to flip a
-    // greedy split decision, which has bitten this project before. Short-circuit it, so
-    // the J* = I consistency check (the A-on-A rows) is exact rather than approximate.
-    if (std::abs(r - 1.0) < 1e-12)
-        return Eigen::Matrix2d::Identity();
-
-    const Eigen::Vector2d d(std::sqrt(r), 1.0 / std::sqrt(r));
-    return V_local * d.asDiagonal() * V_local.transpose();
-}
-
 /// Evaluate mesh energy for triangle of T for MapState
 template <typename T>
 T eval_mesh_energy_triangle_T(
@@ -640,8 +479,7 @@ T eval_mesh_energy_triangle_T(
         const int& _mesh_idx,
         const T& _tel,
         const MapState& _map_state,
-        const AdaptiveTriangulationsSettings& _settings,
-        const Eigen::Matrix2d& _ideal_shape)
+        const AdaptiveTriangulationsSettings& _settings)
 {
     T E_mesh = 0.0;
     if (_settings.w_mesh > 0.0)
@@ -651,33 +489,8 @@ T eval_mesh_energy_triangle_T(
         const Vec3<T> c_lifted = lift_vertex_to_surface(_c_sphere, _map_state.meshes_input[_mesh_idx], _map_state.meshes_embeddings_input[_mesh_idx], _map_state.bsp_embeddings_input[_mesh_idx]);
 
         const Vec3<T> a_ideal = { 0.0, 0.0, 0.0 };
-        Vec3<T> b_ideal_A = { _tel, 0.0, 0.0 };
-        Vec3<T> c_ideal_A = { 0.5 * _tel, sqrt(3) * 0.5 * _tel, 0 };
-
-        // Prescription-aware ideal (settings.prescribed_mesh_ideal). _ideal_shape is
-        // exactly Identity unless this mesh is the B side of a prescribed pair, in which
-        // case the ideal carries the prescribed anisotropy and "good triangle on A AND
-        // on B" no longer implies that J is a rotation.
-        //
-        // Why the metric alone suffices: map_energy re-expresses BOTH triangles through
-        // to_local_coordinates, so it sees each only up to a rigid motion -- i.e. only
-        // through its Gram matrix, its three edge lengths. So deforming the ideal by S
-        // is exactly equivalent to prescribing edge lengths l*^2 = e^T M*_hat e, and the
-        // left singular vectors U never enter. It also means the arbitrary choice of how
-        // the ideal is rotated cannot affect the energy.
-        //
-        // The branch is kept so the disabled path is bit-for-bit the original code.
-        if (!_ideal_shape.isIdentity(0.0))
-        {
-            // Written out rather than as Matrix2d * Vec2<T>: double * T is well defined
-            // for TinyAD scalars, mixed-scalar Eigen products are not.
-            const T bx = _ideal_shape(0, 0) * b_ideal_A[0] + _ideal_shape(0, 1) * b_ideal_A[1];
-            const T by = _ideal_shape(1, 0) * b_ideal_A[0] + _ideal_shape(1, 1) * b_ideal_A[1];
-            const T cx = _ideal_shape(0, 0) * c_ideal_A[0] + _ideal_shape(0, 1) * c_ideal_A[1];
-            const T cy = _ideal_shape(1, 0) * c_ideal_A[0] + _ideal_shape(1, 1) * c_ideal_A[1];
-            b_ideal_A = { bx, by, T(0.0) };
-            c_ideal_A = { cx, cy, T(0.0) };
-        }
+        const Vec3<T> b_ideal_A = { _tel, 0.0, 0.0 };
+        const Vec3<T> c_ideal_A = { 0.5 * _tel, sqrt(3) * 0.5 * _tel, 0 };
 
         E_mesh += map_energy(a_lifted, b_lifted, c_lifted, a_ideal, b_ideal_A, c_ideal_A);
 
@@ -689,9 +502,9 @@ T eval_mesh_energy_triangle_T(
     return (E_mesh * _settings.w_mesh) * (1.0/(double)_map_state.meshes_input.size());
 }
 // Explicit template instantiation
-template double eval_mesh_energy_triangle_T(const Vec3<double>&, const Vec3<double>&, const Vec3<double>&, const int&, const double&, const MapState&, const AdaptiveTriangulationsSettings&, const Eigen::Matrix2d&);
-template TinyAD::Double<12, false> eval_mesh_energy_triangle_T(const Vec3<TinyAD::Double<12, false>>&, const Vec3<TinyAD::Double<12, false>>&, const Vec3<TinyAD::Double<12, false>>&, const int&, const TinyAD::Double<12, false>&, const MapState&, const AdaptiveTriangulationsSettings&, const Eigen::Matrix2d&);
-template TinyAD::Double<12, true> eval_mesh_energy_triangle_T(const Vec3<TinyAD::Double<12, true>>&, const Vec3<TinyAD::Double<12, true>>&, const Vec3<TinyAD::Double<12, true>>&, const int&, const TinyAD::Double<12, true>&, const MapState&, const AdaptiveTriangulationsSettings&, const Eigen::Matrix2d&);
+template double eval_mesh_energy_triangle_T(const Vec3<double>&, const Vec3<double>&, const Vec3<double>&, const int&, const double&, const MapState&, const AdaptiveTriangulationsSettings&);
+template TinyAD::Double<12, false> eval_mesh_energy_triangle_T(const Vec3<TinyAD::Double<12, false>>&, const Vec3<TinyAD::Double<12, false>>&, const Vec3<TinyAD::Double<12, false>>&, const int&, const TinyAD::Double<12, false>&, const MapState&, const AdaptiveTriangulationsSettings&);
+template TinyAD::Double<12, true> eval_mesh_energy_triangle_T(const Vec3<TinyAD::Double<12, true>>&, const Vec3<TinyAD::Double<12, true>>&, const Vec3<TinyAD::Double<12, true>>&, const int&, const TinyAD::Double<12, true>&, const MapState&, const AdaptiveTriangulationsSettings&);
 
 /// Evaluate energy for a landmark vertex of mesh T
 template <typename T>

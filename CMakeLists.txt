@@ -210,7 +210,6 @@ file(GLOB_RECURSE ISM_APPS apps/*.cc)
 # the viewer is off. Add a name here once its viewer usage is guarded.
 set(ISM_HEADLESS_CAPABLE_APPS
     baseline_comparison
-    mobius_probe
     lookup_distortion_probe
 )
 

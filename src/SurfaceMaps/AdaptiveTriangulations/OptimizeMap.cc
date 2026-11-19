@@ -274,22 +274,11 @@ OptimizeMapStatus optimize_map(
             // itself is enforced actively by the trianglepair term. variables_passive
             // still sees the current line-search trial, so the target stays consistent
             // with the iterate being evaluated.
-            Eigen::Matrix2d ideal_shape = Eigen::Matrix2d::Identity();
-            const int presc_pair = prescribed_pair_for_B_mesh(_map_state, _settings, mesh_idx);
-            if (presc_pair >= 0)
-            {
-                const int mA = _map_state.pairs_map_distortion[presc_pair].first;
-                const Eigen::Vector3d a_sph_A = retract(element.variables_passive(v_a.idx() + (mA * num_verts)), v_a, mA);
-                const Eigen::Vector3d b_sph_A = retract(element.variables_passive(v_b.idx() + (mA * num_verts)), v_b, mA);
-                const Eigen::Vector3d c_sph_A = retract(element.variables_passive(v_c.idx() + (mA * num_verts)), v_c, mA);
-                ideal_shape = prescribed_ideal_shape(a_sph_A, b_sph_A, c_sph_A, presc_pair, _map_state);
-            }
-
             return eval_mesh_energy_triangle_T(
                         a_mani_A, b_mani_A, c_mani_A,
                         mesh_idx, tel,
                         _map_state,
-                        _settings, ideal_shape);
+                        _settings);
         });
     }
 
@@ -406,60 +395,6 @@ OptimizeMapStatus optimize_map(
         // Compute Newton decrement (before limiting step length)
         const double newton_decr = TinyAD::newton_decrement(d, g);
         TINYAD_DEBUG_OUT("newton decr: " << newton_decr);
-
-        // --- A<->B symmetry probe (self-map diagnostic, changes nothing) --------
-        // On a self-map E(x_A, x_B) = q(x_A) + q(x_B) + E_map(x_A, x_B) with one q and a
-        // symmetric E_map, so g and H are symmetric at x_A = x_B and the Newton step
-        // cannot break the symmetry. It does. This separates the two explanations:
-        // a gradient that is already asymmetric (a bug in the assembly) from a
-        // symmetric gradient whose antisymmetric component the Hessian projection
-        // amplifies (a saddle, hessian_projection_eps turning curvature <= 0 into eps).
-        // The DOF layout is 2*v.idx() + 2*i*num_verts, so mesh 0 and mesh 1 are the two
-        // contiguous halves, and the tangent bases are componentwise comparable exactly
-        // when the embeddings agree -- which basis_diff checks rather than assumes.
-        if (_settings.probe_symmetry && n_meshes == 2)
-        {
-            double basis_diff = 0.0, emb_diff = 0.0;
-            for (auto vh : _map_state.mesh_T.vertices())
-            {
-                basis_diff = std::max(basis_diff, (B1[0][vh] - B1[1][vh]).norm());
-                basis_diff = std::max(basis_diff, (B2[0][vh] - B2[1][vh]).norm());
-                emb_diff = std::max(emb_diff,
-                        (_map_state.embeddings_T[0][vh] - _map_state.embeddings_T[1][vh]).norm());
-            }
-
-            const int half = 2 * num_verts;
-            const double g_anti = (g.head(half) - g.tail(half)).norm();
-            const double d_anti = (d.head(half) - d.tail(half)).norm();
-
-            // Curvature the PROJECTED Hessian assigns to the antisymmetric direction
-            // Newton actually chose. If this sits at hessian_projection_eps, the step is
-            // manufactured by the projection clamp rather than by the energy.
-            Eigen::VectorXd u = Eigen::VectorXd::Zero(n);
-            u.head(half) = d.head(half) - d.tail(half);
-            u.tail(half) = -u.head(half);
-            double curv = std::numeric_limits<double>::quiet_NaN();
-            double g_along = std::numeric_limits<double>::quiet_NaN();
-            if (u.norm() > 0.0)
-            {
-                u /= u.norm();
-                curv = u.dot(H_proj * u);
-                g_along = u.dot(g);
-            }
-
-            ISM_HIGHLIGHT("[symprobe] iter=" << iter
-                     << " |V(T)|=" << num_verts
-                     << " emb_diff=" << emb_diff
-                     << " basis_diff=" << basis_diff
-                     << " |g|=" << g.norm() << " g_anti=" << g_anti
-                     << " g_anti_rel=" << g_anti / std::max(g.norm(), 1e-300)
-                     << " |d|=" << d.norm() << " d_anti=" << d_anti
-                     << " d_anti_rel=" << d_anti / std::max(d.norm(), 1e-300)
-                     << " curv_anti=" << curv
-                     << " g_along_anti=" << g_along
-                     << " hess_eps=" << _settings.hessian_projection_eps);
-        }
-
         // Limit max step size
         double tangent_length_limit = tan(75.0 * M_PI / 180.0); // 75° vertex movement
 

@@ -80,406 +80,76 @@ namespace SurfaceMaps
 //    degenerates to dirichlet. No reason to run it again.
 // ---------------------------------------------------------------------------
 
-/// The mesh pair. Both meshes MUST share connectivity: the ground-truth correspondence
-/// metric assumes vertex i of A maps to vertex i of B, and extract_jacobian_field pairs
-/// faces by index. Verify with
-///   diff <(sed 's#/[0-9]*##g' A.obj | grep '^f ') <(sed 's#/[0-9]*##g' B.obj | grep '^f ')
-/// (strip the /vt/vn indices first -- normals legitimately differ between the two).
-///
-///   l_shape: 786 verts. Identity for x <= 2.08, x -> 2x-1.93 for x >= 2.42, ~101-face
-///            transition band. Flat faces + sharp edges, so all curvature sits at the
-///            cone points and the developable regions give the energy soft modes.
-///   u_shape: 5852 verts. Base stretched 2x in x, both arms translated +-0.65 rigidly,
-///            transition at |x| ~ 0.65. 7.4x bigger, so runs are substantially slower.
+/// Mesh pair. Both meshes MUST share connectivity (corr metric and J* pair by index). See docs/baseline_comparison_notes.md#mesh_dir
 const std::string MESH_DIR = "meshes/l_shape";
 const std::string MESH_A   = "newL.obj";
 const std::string MESH_B   = "stretchedL.obj";
 
-/// 8 / 16 / 32 swept. 16 was marginally best (corr 0.0062 vs 0.0074) and gave the widest
-/// prescribed-vs-dirichlet gap (4.6x); 32 degrades 2.3x and collapses the gap to 1.03x,
-/// because hard landmark constraints start determining the answer instead of the energy.
-/// Held at 8 so the W_MESH sweep below is directly comparable to the W_MAP sweep.
+/// 16 is best measured; 32 over-constrains and collapses the prescribed gap to 1.03x. See docs/baseline_comparison_notes.md#n_fps_landmarks
 const int  N_FPS_LANDMARKS = 16;
 const bool OPEN_VIEWER     = true; // false = write screenshots instead
 
-/// Release the landmarks after the landmark phase -- which is what EVERY upstream app
-/// does and this one never did (n_meshes.cc:115, approximation.cc:42,
-/// resolution_T.cc:124, curvature_based_sizing.cc:112, initialization_hands.cc:87, all
-/// of them immediately after landmark_phase() and before coarse_phase()).
-///
-/// With this OFF, coarse_phase_settings() and fine_phase_settings() set
-/// hard_landmark_constraints = true, and OptimizeMap.cc:62 then ELIMINATES
-/// 2 * n_meshes * n_landmarks DOFs via the constraint matrix C -- so the N_FPS_LANDMARKS
-/// landmark vertices of T are frozen on BOTH spheres for the entire coarse and fine
-/// phases. Those correspondences are then decided by farthest-point sampling plus the
-/// landmark phase rather than by the energy, which is not how the paper runs the
-/// algorithm, and is the suspected cause of the N_FPS_LANDMARKS sweep collapsing: 32
-/// landmarks degraded corr 2.3x and shrank the prescribed-vs-dirichlet gap from 4.6x to
-/// 1.03x (see the note on N_FPS_LANDMARKS above).
-///
-/// Nothing else in this app reads the landmarks after the phases except
-/// view_landmark_balls, which simply draws nothing once they are released.
+/// Release the pins after the landmark phase, as every upstream app does. See docs/baseline_comparison_notes.md#release_landmarks
 const bool RELEASE_LANDMARKS = true;
 
-/// Ablation, A-on-B configs only: give mesh B the SAME sphere embedding as mesh A.
-/// The two L meshes share connectivity, so the initial map is then exactly the
-/// ground-truth correspondence, and the question becomes whether the energy HOLDS it.
-/// Our sharpest diagnostic: at W_MAP = 100 it showed dirichlet drifting AWAY from the
-/// correct map (0.0160 -> 0.0258) while prescribed holds and improves it
-/// (0.00515 -> 0.00332) -- a 7.8x gap, and the demonstration that the correct map is
-/// not the as-isometric-as-possible one.
+/// Give B mesh A's own embedding, so the initial map is exactly correct. See docs/baseline_comparison_notes.md#start_from_ground_truth
 const bool START_FROM_GROUND_TRUTH = false;
 
-/// Run the COARSE phase with the prescribed energy too, not just the fine phase.
-/// At W_MAP = 1 this helped from scratch (0.0471 -> 0.0326) and hurt from the
-/// ground-truth start (0.0132 -> 0.0151): a noisy-but-roughly-right signal that
-/// dominates noise when far from the answer and contributes only noise when already
-/// there. Worth re-checking now that the weights have moved, so it stays a flag.
+/// Use the prescribed energy in the coarse phase too, not only the fine one. See docs/baseline_comparison_notes.md#prescribed_in_coarse_phase
 const bool PRESCRIBED_IN_COARSE_PHASE = true;
 
-/// Weight of the map-distortion term -- the only term the prescription lives in.
-/// SWEEP DONE (1 / 10 / 100): the prescription was being outvoted. At 100, A-on-B
-/// prescribed improves 0.0326 -> 0.00742 corr_mean, the prescribed-vs-dirichlet gap
-/// widens 1.4x -> 3.5x, and the A-on-A self-map drift collapses 0.0195 -> 0.000427
-/// (which retired the "continuous optimizer breaks the symmetry" mystery -- it was
-/// the weighting all along).
-/// HOLD AT 1.0 while sweeping W_MESH below: that separation is the point of the sweep.
+/// Weight on E_map. Swept; 1.0 is the measured optimum. See docs/baseline_comparison_notes.md#w_map
 const double W_MAP = 1.0;
 
-/// Weight of the mesh-quality term. THIS IS THE CURRENT SWEEP: 1 / 0.1 / 0.01, with
-/// W_MAP held at 1.
-///
-/// Why this term specifically. eval_mesh_energy_triangle_T builds an ideal EQUILATERAL
-/// triangle of side tel and runs symmetric Dirichlet between the lifted T triangle and
-/// that ideal -- once per input mesh. So it demands every T triangle be equilateral on
-/// A *and* equilateral on B, and those two demands together imply J is a rotation.
-/// E_mesh therefore carries a hidden isometry prior on the map, and it is mutually
-/// UNSATISFIABLE with an anisotropic prescription: a triangle cannot be equilateral on
-/// both sides when sigma = (2, 1). E_approx, by contrast, is indifferent to J -- it only
-/// wants T to hug the surfaces.
-///
-/// So E_mesh is the likely antagonist, and W_MAP = 100 escaped it only incidentally, by
-/// down-weighting everything else at once. Prediction: lowering W_MESH alone recovers
-/// most of the W_MAP = 100 gain. If it does, the honest fix is prescription-aware ideal
-/// triangles -- apply the already-looked-up V and Sigma to the ideal on the B side --
-/// rather than a 100x multiplier on the map term.
+/// Weight on E_mesh. 0.01 is the recommended value; 1.0 is the upstream default. See docs/baseline_comparison_notes.md#w_mesh
 const double W_MESH = 0.01;
 
-/// PRIORITY 3: make E_mesh prescription-aware instead of down-weighting it.
-///
-/// E_mesh builds an ideal EQUILATERAL triangle of side tel and runs symmetric Dirichlet
-/// between the lifted T triangle and that ideal, once per input mesh -- so it demands
-/// every T triangle be equilateral on A *and* on B, which together imply J is a rotation.
-/// That isometry prior is mutually unsatisfiable with an anisotropic prescription.
-///
-/// With this on, the B-side ideal instead carries the prescribed anisotropy: the ideal's
-/// edge vectors are multiplied by S = (M*/sqrt(det M*))^(1/2), which is SPD with det 1,
-/// so the ideal gets the prescribed SHAPE and keeps the sizing field's AREA. Satisfying
-/// both terms then implies J ~ J* rather than J ~ rotation.
-///
-/// WHY THIS AND NOT MORE WEIGHT TUNING. On the sphere pair, at matched T resolution
-/// (2188 vs 2120 faces) and where T out-resolves the field 6x so the lookup is not
-/// binding, dropping W_MESH 1.0 -> 0.1 improved the PRESCRIBED residual 4.4x
-/// (0.0687 -> 0.0156) while improving the DIRICHLET control only 1.18x
-/// (0.1571 -> 0.1329). That differential is the isometry prior, isolated. And no single
-/// W_MESH works across shapes (L wants 0.01, U wants 1.0, sphere wants 0.1), so
-/// down-weighting leaves a per-mesh tuning parameter behind.
-///
-/// PREDICTION, pre-registered against the nine baselines already on disk: with this on at
-/// W_MESH = 1, each shape should reach roughly its own best-W_MESH residual --
-/// L ~0.051, U ~0.223, sphere ~0.014 -- untuned.
-///
-/// Reduces EXACTLY to the old ideal when J* = I, so the A-on-A rows are the correctness
-/// check: they must stay bit-identical to a run with this off. (Verified: all six A-on-A
-/// rows across the three shapes are bit-identical.)
-///
-/// RESULT (2026-10-22), in two parts -- read both, the first one alone is misleading.
-///
-/// FROM THE DEFAULT INITIALIZATION the prediction above FAILED:
-///   - Alone at W_MESH = 1 it buys 1.21x (L), 1.29x (sphere), and COSTS 14% (U).
-///   - W_MESH down-weighting alone buys 4.45x (L), 4.89x (sphere).
-///   - On top of W_MESH = 0.01 it buys NOTHING: 0.83x (L), 0.95x (sphere).
-/// So the isometry prior is a real but minor effect, fully subsumed by down-weighting.
-/// E_mesh's harm is its MAGNITUDE, not its BIAS -- giving it the correct anisotropic
-/// target changes little; how hard it pushes is what matters.
-///
-/// FROM THE MOBIUS-FITTED INITIALIZATION it works, and the first reading was confounded.
-/// With MOBIUS_FITTED_EMBEDDING_B = true and W_MESH = 0.01 on the L:
-///   mobius alone  0.05113 -> 0.04663 (1.10x)   -- despite a 1.76x better INITIAL residual
-///   pmesh alone   0.05113 -> 0.06145 (0.83x)   -- hurts
-///   BOTH          0.05113 -> 0.03515 (1.45x)   -- vs 0.91x if the two were independent
-/// A real interaction (~1.6x). Mobius supplies a better basin; E_mesh's isometry prior
-/// drags the map back off it; pmesh removes the prior so the advantage survives. Neither
-/// alone is worth anything.
-///
-/// BEST KNOWN CONFIGURATION on the L: W_MESH = 0.01 + PRESCRIBED_MESH_IDEAL
-///   + MOBIUS_FITTED_EMBEDDING_B. Prescribed 0.03515 res / 0.00247 corr / 0.01918
-///   corr_max against a dirichlet 0.10924 / 0.01443 / 0.07048 and an A-on-A floor of
-///   0.01576 / 0.00143 / 0.01861 -- i.e. 3.1x / 5.8x / 3.7x over dirichlet, with the
-///   WORST-CASE correspondence error now sitting AT the self-map floor.
-///
-/// Parked OFF so this file still reproduces the plain baseline; flip both (and W_MESH)
-/// to get the best result. Its one regression (the U, 0.86x) is lookup-driven: pmesh
-/// consumes the centroid lookup's output, so it amplifies lookup error where the lookup
-/// is worst. Its benefit is monotone in T's resolution relative to the prescribed field
-/// -- U 0.16x of the field: 0.86x; L 0.45x: 1.21x; sphere 6.84x: 1.29x.
-const bool PRESCRIBED_MESH_IDEAL = false;
-
-/// Give mesh B the MOBIUS-FITTED sphere embedding produced by the `mobius_probe` app
-/// (`output/mobius_probe_<shape>/embedding_B_mobius_fitted.obj`), instead of the one
-/// multi_res_sphere_embedding + align_rotation produced.
-///
-/// The probe fits a 6-DOF Mobius transformation of B's embedding to minimize the INITIAL
-/// residual: on the L that takes 0.2303 -> 0.1302 (1.77x), of which a landmark-only fit
-/// reaches 0.1466 (84% of the achievable gain). A Mobius transformation of the sphere is a
-/// diffeomorphism, so the transformed embedding is still bijective, and J* is untouched
-/// (extract_jacobian_field reads only the two meshes).
-///
-/// Its purpose here is as a CONTROL on the priority-3 refutation: if E_mesh's isometry
-/// prior looked minor only because the map starts far from the answer, then starting
-/// closer should make PRESCRIBED_MESH_IDEAL matter more. Applies to A-on-B configs only --
-/// SelfMap must keep both embeddings identical, and START_FROM_GROUND_TRUTH overrides it.
-const bool MOBIUS_FITTED_EMBEDDING_B = false;
-
-/// Treat E_mesh's target edge length as the passive SIZING FIELD it is, instead of
-/// re-computing it as a differentiable function of the map. See
-/// AdaptiveTriangulationsSettings::mesh_tel_passive for the mechanism; in short, the
-/// active re-computation makes tel a map DOF with d/d(tel) ~ -2 l^2/tel^3 against a
-/// sizing floor of 1e-3, so E_mesh contributes ~1e9 of gradient where E_map contributes
-/// ~1.6, and the strict `<` tie-break routes all of it onto mesh 0.
-///
-/// It is in the OUTPUT TAG because it is not a tuning knob: every CSV without
-/// `_telpassive` in its name was produced with the bug live, and the two are not
-/// comparable. On the U self-map at W_MESH = 0.01 it takes corr_mean from 1.37e-2 to
-/// 1.60e-8 -- the "self-map floor" that the first column of every error budget was
-/// normalized against was this bug, not a resolution limit.
+/// Treat E_mesh's tel as a passive sizing field. Fixes a ~1e9 spurious gradient. See docs/baseline_comparison_notes.md#mesh_tel_passive
 const bool MESH_TEL_PASSIVE = true;
 
-/// Per-iteration trace, via the optimizer's own two callbacks (nothing in the algorithm
-/// changes). _callback_for_optim fires once per Newton iteration, inside the loop, after
-/// embeddings_T and the local bases are updated (OptimizeMap.cc "after_optimization");
-/// _callback_for_remesh fires three times per remeshing pass (Remeshing.cc
-/// "after_splits" / "after_collapses" / "after_flips"). Because they are separate, a
-/// change can be attributed to a continuous step or to one specific remeshing operation.
-///
-/// It also records embedding_drift and min_angle_stats, which turn the self-map floor
-/// into something directly attributable -- see those two helpers.
-///
-/// ANSWERED TWICE.
-///
-/// (1) Refinement sharpens the MEASUREMENT, it does not degrade the map: the residual
-///     jumps at after_splits while corr stays flat across those same splits. Confirmed
-///     independently by drift, which is resolution-free and does NOT rise at splits.
-///
-/// (2) 2026-10-25, U self-map, W_MESH 0.01 and 1.0. The floor is made by the CONTINUOUS
-///     optimizer, not by remeshing and not by triangle quality:
-///                                        W_MESH 1.0      W_MESH 0.01
-///       corr increase from Newton steps     95.2%           95.6%
-///       drift_max increase from Newton     100.0%          100.0%
-///       net drift from after_collapses     +0.04 deg       -0.33 deg  (healing)
-///       net drift from after_flips          0.00 deg        0.00 deg  (exactly zero)
-///       final mean min-angle               30.98 deg       27.48 deg  (-11%)
-///       final mean drift                    0.37 deg        1.63 deg  (4.5x)
-///     Quality barely moves while drift grows 4.5x, so the two are uncorrelated and a
-///     smoothing operator cannot be the fix. Frames 0-3 are the sharp bit: splits and
-///     collapses take T from 30 to 47 to 40 vertices with drift at EXACTLY 0 and corr at
-///     6e-17, then the first Newton step alone puts drift at 2.57 deg and corr at
-///     0.0018. See embedding_drift for why that step should be impossible.
-///
-/// OFF by default: it lifts all input vertices every frame and roughly doubles runtime.
-/// Run only the two A-on-A configs and skip A-on-B. For the floor diagnostic the
-/// self-map is the whole question and A-on-B just doubles the runtime; on the U that
-/// matters. (And on a self-map J* = I, so the dirichlet and prescribed rows are the
-/// same computation -- one of the two is enough.)
+/// Run only the A-on-A configs (the self-map floor diagnostic). See docs/baseline_comparison_notes.md#self_map_only
 const bool SELF_MAP_ONLY      = false;
 
-/// Log the A<->B antisymmetric part of the gradient and the Newton direction once per
-/// iteration (see AdaptiveTriangulationsSettings::probe_symmetry). Pair with
-/// SELF_MAP_ONLY -- it is only meaningful on a self-map.
-const bool PROBE_SYMMETRY     = false;
-
-/// Mirror of SELF_MAP_ONLY: run only the two A-on-B configs and skip A-on-A.
-///
-/// For the GT-START ablation the self-map rows are pure overhead -- SelfMap always
-/// shares its embedding, so START_FROM_GROUND_TRUTH does not change them and they
-/// duplicate the plain run's A-on-A rows exactly. Since the tel fix put them at
-/// 1e-11 they carry no information either. On a 52k-vertex input that is half the
-/// runtime for nothing.
+/// Run only the A-on-B configs, skipping the self-map pair. See docs/baseline_comparison_notes.md#stretched_only
 const bool STRETCHED_ONLY     = true;
 
-/// Multiply the coarse AND fine phases' target approximation error (0.01 / 0.001) by
-/// this factor, which is the ONLY clean way to move T's resolution while holding the
-/// input mesh, its geometry and the prescribed field J* exactly fixed.
-///
-/// tel ~ sqrt(6 * approx_error / curvature), so |F(T)| ~ 1/approx_error: 0.25 gives
-/// roughly 4x the faces, 4.0 roughly a quarter.
-///
-/// This exists to test one claim: that the prescribed energy's advantage over symmetric
-/// Dirichlet is set by how finely T samples J*, not by the shape. Measured at
-/// |F(T)|/|F(input)|, that advantage runs U 0.22 -> 0.99x, L 0.64 -> 9.88x,
-/// sphere 5.79 -> 32x, monotone at two weight settings independently. But the three
-/// shapes differ in more than that ratio, so the correlation does not establish cause.
-/// Scaling T on ONE shape does: refine the U toward the L's ratio and the advantage
-/// should appear; coarsen the L toward the U's and it should vanish.
-///
-/// NOT testable by subdividing the input. A linear subdivision whose displaced mesh is
-/// the piecewise-linear interpolant of the original (verified: agrees to 1.2e-6) leaves
-/// J* unchanged -- every child triangle inherits its parent's Jacobian -- so it adds
-/// redundant samples of the same field rather than a finer field. It also hands every
-/// face-interior vertex zero discrete curvature, which corrupts the sizing field and
-/// made T COARSER (2606 -> 920 faces), moving the ratio by the wrong mechanism.
+/// Multiplier on both phases' approx_error. 1.0 is the paper's setting. See docs/baseline_comparison_notes.md#approx_error_scale
 const double APPROX_ERROR_SCALE = 1.0;
 
-/// THE GT LOOKUP MEASUREMENT. Remesh T but never take a Newton step
-/// (AdaptiveTriangulationsSettings::remesh_only), so paired with
-/// START_FROM_GROUND_TRUTH the map stays EXACTLY at the ground truth while T is refined
-/// to whatever APPROX_ERROR_SCALE asks for.
-///
-/// Why that is the measurement we want: the residual metric compares the ACHIEVED
-/// Jacobian of each T triangle against the J* the energy looks up for it. When the map
-/// is the ground truth the achieved Jacobian IS the true one, so the residual stops
-/// being map error and becomes exactly "how wrong is the looked-up J* on this triangle".
-/// The lookup is a single point sample -- the input face of A's embedding containing the
-/// T triangle's CENTROID -- so this measures the error of representing a field that
-/// varies across the triangle by one sample at its middle, plus the error of projecting
-/// that face's V frame into the T triangle's own basis.
-///
-/// corr_mean must stay at ~1e-17 in every stage of such a run. That is the built-in
-/// proof that the map did not move and the number means what it claims.
-const bool REMESH_ONLY = false;
-
-/// Cap on the sizing field, overriding the phases' default of 100.0 -- i.e. no cap at
-/// all, on a mesh normalized to surface area 1.
-///
-/// The knob APPROX_ERROR_SCALE cannot reach. tel = sqrt(6*e/kappa - 3*e^2) CLAMPED to
-/// [min_edge_length, max_edge_length]; on a flat region kappa -> 0 sends tel to infinity
-/// and the clamp pins it at max_edge_length whatever e is. So scaling the approximation
-/// error refines T only where it is already curved and leaves flat regions exactly as
-/// coarse -- and on the U that is precisely where the J* lookup error lives.
-///
-/// Measured by lookup_distortion_probe at the frozen ground truth, U, approx scale 1:
-///   max_el 100 -> |F(T)| 1996, lookup error 0.0473, 17.2% of area off by >10%
-///   max_el 0.3 -> |F(T)| 3324, lookup error 0.00446
-///   max_el 0.1 -> |F(T)| 3534, lookup error 0.00269
-///   max_el 0.03-> |F(T)| 4628, lookup error 0.00120
-/// 39x less lookup error for 2.3x the faces. The L barely moves (0.0035 -> 0.0046), so
-/// the mechanism is specific to shapes with large flat regions.
+/// Global cap on tel. 0.03 is the recommended value; 100.0 is effectively uncapped. See docs/baseline_comparison_notes.md#max_edge_length
 const double MAX_EDGE_LENGTH = 0.03;
 
 const bool TRACE_ITERATIONS   = false;
 
-/// Also dump the lifted T on each input mesh, once per traced step, as
-///   <config>/trace/fNNNN_<kind>_{A,B}.obj
-/// Those are the animation frames. Render them with
-///   tools/render_trace.py <config_output_dir>
-/// which rasterizes them locally (numpy + Pillow) because the app's own screenshot path
-/// needs glow/OpenGL 4.2+ and cannot build on Apple Silicon. Verified read-only: with the
-/// trace on, the L released pair reproduces 0.0392886 / 0.00397053 exactly.
-///
-/// Costs disk: 402 frames x 2 meshes is 46 MB for the L at this config.
+/// Also dump the lifted T per step as OBJ frames; render with tools/render_trace.py. See docs/baseline_comparison_notes.md#trace_write_meshes
 const bool TRACE_WRITE_MESHES = false;
 /// Dump a mesh only every Nth traced step (the CSV always gets every step).
 const int  TRACE_MESH_STRIDE  = 1;
 
-/// Checkerboard transfer settings.
-/// Texcoords are built as (point[(dir+1)%3], point[(dir+2)%3]), so dir = 2 gives
-/// (x, y) -- the right choice for the L, which lies in the xy-plane and is extruded
-/// along z. (dir = 1 would give (z, x), i.e. constant across the L's main faces,
-/// which degenerates the checkerboard into stripes.)
-/// Raise TEXTURE_FACTOR if the checkers are too coarse: init_map normalizes the
-/// meshes to unit surface area, so their coordinates only span ~0.5.
-///
-/// Note it does not mean the same thing in all three TEXTURE_SOURCE schemes, because they
-/// lay out different amounts of uv per unit surface. On a unit-area mesh the uv-per-
-/// world-length works out at ~0.99*factor for Triplanar against sqrt(2)*factor for
-/// Sphere, so Triplanar cells come out ~1.4x coarser at the same number; ~5.7 matches
-/// what Sphere gives at 4.0. Unlike Sphere, Triplanar's cell size is near-uniform (1.5x
-/// spread, measured), so one factor is right everywhere on the mesh.
+/// Checkerboard transfer settings. PROJECTION_DIR applies to TexSource::Planar only. See docs/baseline_comparison_notes.md#texture_projection_dir
 const int    TEXTURE_PROJECTION_DIR = 2;
 const double TEXTURE_FACTOR         = 4.0;
 
-/// Where the checkerboard UVs come from. Three schemes, in the order they were written;
-/// each fixes a defect of the one before.
-///
-/// TexSource::Planar -- the original. Texcoords are the lifted point projected along
-///   TEXTURE_PROJECTION_DIR. Degenerates on every face PARALLEL to the projection axis,
-///   and the L is a plate extruded along z, so 56% of its area is extrusion wall:
-///   measured UV foreshortening 0.98 on the front and back but 0.014-0.037 on the walls,
-///   with 33.6% of the area at an effectively ZERO UV area. A collapsed UV triangle makes
-///   the GPU's texture derivatives singular -- that is the shimmering on the top faces
-///   and the squashed checkers on the sides. No axis helps: dir 0 and 1 are worse (45.9%
-///   and 43.2% degenerate against dir 2's 33.6%), because the L has 12-23% of its area
-///   facing each of the six directions.
-///
-/// TexSource::Sphere -- UVs as lat-long on the map's own shared domain. Removes the
-///   degeneracy completely (0% collapsed) and is the most faithful to what the algorithm
-///   actually optimizes. But the sphere embedding has its own 51x area distortion, so
-///   cell SIZE varies for reasons that have nothing to do with the map, which makes it
-///   hard to read: a cell can look stretched because the embedding compressed there.
-///   Plus the two poles pinch. Keep 2*TEXTURE_FACTOR a whole number here -- that is the
-///   u-distance of a full wrap, so an integer keeps the tiling continuous across the seam.
-///
-/// TexSource::Triplanar -- each face projected onto whichever coordinate plane it faces
-///   most directly. UV density is bounded in [0.577, 1.0] BY CONSTRUCTION, for any mesh:
-///   never collapses, and at most 1.73x size variation. So cells are near-uniform on the
-///   reference and a stretched cell on the target really is the map stretching. The cost
-///   is that the pattern breaks phase across chart boundaries; on the L those follow the
-///   creases, where a break reads as the geometry.
-///
-/// Read distortion with Triplanar; check what the optimizer sees with Sphere.
+/// Where the checkerboard UVs come from. Read distortion with Triplanar; check what
+/// the optimizer sees with Sphere. Planar degenerates on 53.8% of the L's area.
+/// See docs/baseline_comparison_notes.md#texture_source
 enum class TexSource { Planar, Sphere, Triplanar };
 const TexSource TEXTURE_SOURCE = TexSource::Triplanar;
 
-/// Draw the landmarks as world-space balls INSIDE the two renders (wire and texture),
-/// not as a third render of their own -- see overlay_landmarks() in run(). The separate
-/// view_landmark_balls() render this used to call drew its own grey copy of each input
-/// mesh, so it could not be read against the wireframe or the checkers without flipping
-/// between two images -- which was the only reason to look at it.
-///
-/// The larger ball is T's landmark lifted onto the mesh (where the map puts it), the
-/// smaller one is the landmark pinned on the input mesh (where it should be), same colour
-/// per landmark across the grid. The small one hides inside the large one when the
-/// constraint holds, so: one ball = satisfied, two balls = drift, and the gap is the
-/// error. Radius is relative to the bounding-box diagonal.
-///
-/// With RELEASE_LANDMARKS on there is no landmarks_T left to draw, so only the small
-/// reference balls appear. Still worth having: the same colour marks the same landmark on
-/// A and on B, so the correspondence is readable straight off the pair.
+/// Draw landmark balls into the wire and texture renders, not as a render of their own. See docs/baseline_comparison_notes.md#landmark_balls
 const bool   LANDMARK_BALLS         = true;
 const double LANDMARK_RADIUS_FACTOR = 0.015;
 
-/// Map-driven sizing field (PROTOTYPE). Refine T where the PRESCRIBED metric jumps, not
-/// only where the surface curves. See map_driven_target_edge_lengths in
-/// AdaptiveTargetEdgeLength.hh for the construction and AdaptiveTriangulationsSettings
-/// for what each number means.
-///
-/// Requires MESH_TEL_PASSIVE. The field only acts through E_mesh, so W_MESH scales how
-/// much authority it has: at 0.01 a 2x finer tel in a thin band is a 4x local E_mesh
-/// signal, down-weighted 100x, which may not be enough to fire any split. Check
-/// n_band_T in the CSV before concluding anything -- if it does not move, the field was
-/// outvoted rather than wrong, and the thing to change is W_MESH, not the floor.
+/// Also refine T where the PRESCRIBED metric jumps, not only where the surface curves. See docs/baseline_comparison_notes.md#map_driven_tel
 const bool   MAP_DRIVEN_TEL    = true;
 const double MAP_TEL_FLOOR     = 0.015;
 
-/// How the detected seam becomes a field. HeatDiffusion is the default: one short-time
-/// implicit heat step, band width set by MAP_TEL_DIFFUSION_LENGTH below. GeodesicDijkstra
-/// is the original dilate-then-Dijkstra path, kept so the earlier numbers reproduce;
-/// MAP_TEL_GRADATION and MAP_TEL_MIN_RINGS apply only to it.
-const MapTelMethod MAP_TEL_METHOD = MapTelMethod::HeatDiffusion;
-
-/// Diffusion length w, in world units on mesh A (t = w^2). 0 = auto, 2x mesh A's mean
-/// edge length. Mesh A's mean edge is 0.0447 on the L and ~0.0149 on the U, so auto is
-/// ~0.089 and ~0.030 -- set it explicitly to make the band mean the same physical
-/// thickness on both.
+/// Heat diffusion length w on mesh A (t = w^2). 0 = auto, max(2*FLOOR, mean edge). See docs/baseline_comparison_notes.md#map_tel_diffusion_length
 const double MAP_TEL_DIFFUSION_LENGTH = 0.0;
 
-/// Write tel_01_jump / tel_02_phi / tel_03_sizing PLYs per config. Headless-safe; render
-/// them with tools/render_field.py. The field is identical in both phases, so the coarse
-/// phase's dump is simply overwritten by the fine phase's.
+/// Write the three sizing-field PLYs per config; render with tools/render_field.py. See docs/baseline_comparison_notes.md#map_tel_debug_ply
 const bool   MAP_TEL_DEBUG_PLY = true;
 
-const double MAP_TEL_GRADATION = 0.5;
-const int    MAP_TEL_MIN_RINGS = 2;
 
 // ---------------------------------------------------------------------------
 
@@ -534,15 +204,12 @@ struct Config
         const std::string gt = (pair_mode == PairMode::Stretched && START_FROM_GROUND_TRUTH) ? "_gt" : "";
         return pair + "_" + energy + "_" + lm + gt
              + weight_tag("wmap", W_MAP) + weight_tag("wmesh", W_MESH)
-             + (PRESCRIBED_MESH_IDEAL ? "_pmesh" : "")
              + (MESH_TEL_PASSIVE ? "_telpassive" : "")
              + weight_tag("approx", APPROX_ERROR_SCALE)
-             + (REMESH_ONLY ? "_frozen" : "")
              + weight_tag("mel", MAX_EDGE_LENGTH / 100.0)
              + (MAP_DRIVEN_TEL ? ("_mdtel" + weight_tag("floor", MAP_TEL_FLOOR)) : "")
              + (RELEASE_LANDMARKS ? "_rellm" : "")
-             + ((pair_mode == PairMode::Stretched && MOBIUS_FITTED_EMBEDDING_B
-                 && !START_FROM_GROUND_TRUTH) ? "_mob" : "");
+             ;
     }
 };
 
@@ -971,24 +638,6 @@ void run_config(
         ISM_INFO("Using shared sphere embedding (initial map = ground truth)");
     }
 
-    // Mobius-fitted embedding for B. Mutually exclusive with share_embedding: that path
-    // deliberately makes both embeddings equal, which this would break.
-    if (MOBIUS_FITTED_EMBEDDING_B && !share_embedding
-        && _config.pair_mode == PairMode::Stretched)
-    {
-        const fs::path fitted = OUTPUT_PATH
-                / ("mobius_probe_" + fs::path(MESH_DIR).filename().string())
-                / "embedding_B_mobius_fitted.obj";
-        ISM_ASSERT(fs::exists(fitted)); // run `mobius_probe <dir> <A> <B> <fps>` first
-        // A's embedding must still be the ORIGINAL one: the fit was computed against it.
-        const fs::path src_A = _output_root
-                / ("AonB_prescribed_fps" + std::to_string(N_FPS_LANDMARKS)) / "embedding_A.obj";
-        ISM_ASSERT(fs::exists(src_A));
-        fs::copy_file(src_A, embedding_path_A, fs::copy_options::overwrite_existing);
-        fs::copy_file(fitted, embedding_path_B, fs::copy_options::overwrite_existing);
-        ISM_INFO("Using the Mobius-fitted embedding for mesh B");
-    }
-
     if (_config.pair_mode == PairMode::SelfMap)
         ISM_INFO("Self-map consistency check: expecting the identity map");
 
@@ -1077,20 +726,14 @@ void run_config(
         AdaptiveTriangulationsSettings settings = coarse_phase_settings();
         settings.use_prescribed_jacobian = prescribed && PRESCRIBED_IN_COARSE_PHASE;
         settings.prescribed_metric_form = true;
-        settings.prescribed_mesh_ideal = PRESCRIBED_MESH_IDEAL;
         settings.mesh_tel_passive = MESH_TEL_PASSIVE;
         settings.map_driven_tel = MAP_DRIVEN_TEL;
         settings.map_tel_floor = MAP_TEL_FLOOR;
-        settings.map_tel_method = MAP_TEL_METHOD;
         settings.map_tel_diffusion_length = MAP_TEL_DIFFUSION_LENGTH;
-        settings.map_tel_gradation = MAP_TEL_GRADATION;
-        settings.map_tel_min_rings = MAP_TEL_MIN_RINGS;
         if (MAP_TEL_DEBUG_PLY)
             settings.map_tel_debug_dir = output_dir / "sizing_field";
         settings.approx_error *= APPROX_ERROR_SCALE;
-        settings.remesh_only = REMESH_ONLY;
         settings.max_edge_length = std::min(settings.max_edge_length, MAX_EDGE_LENGTH);
-        settings.probe_symmetry = PROBE_SYMMETRY;
         settings.w_map = W_MAP;
         settings.w_mesh = W_MESH;
         probe_weight_overrides(settings);
@@ -1103,20 +746,14 @@ void run_config(
         AdaptiveTriangulationsSettings settings = fine_phase_settings();
         settings.use_prescribed_jacobian = prescribed;
         settings.prescribed_metric_form = true; // metric form, not the legacy full-J* residual
-        settings.prescribed_mesh_ideal = PRESCRIBED_MESH_IDEAL;
         settings.mesh_tel_passive = MESH_TEL_PASSIVE;
         settings.map_driven_tel = MAP_DRIVEN_TEL;
         settings.map_tel_floor = MAP_TEL_FLOOR;
-        settings.map_tel_method = MAP_TEL_METHOD;
         settings.map_tel_diffusion_length = MAP_TEL_DIFFUSION_LENGTH;
-        settings.map_tel_gradation = MAP_TEL_GRADATION;
-        settings.map_tel_min_rings = MAP_TEL_MIN_RINGS;
         if (MAP_TEL_DEBUG_PLY)
             settings.map_tel_debug_dir = output_dir / "sizing_field";
         settings.approx_error *= APPROX_ERROR_SCALE;
-        settings.remesh_only = REMESH_ONLY;
         settings.max_edge_length = std::min(settings.max_edge_length, MAX_EDGE_LENGTH);
-        settings.probe_symmetry = PROBE_SYMMETRY;
         settings.w_map = W_MAP;
         settings.w_mesh = W_MESH;
         settings.max_iterations = 50;
@@ -1167,14 +804,12 @@ void run()
             + std::string(START_FROM_GROUND_TRUTH ? "_gt" : "")
             + std::string(PRESCRIBED_IN_COARSE_PHASE ? "_pcoarse" : "")
             + weight_tag("wmap", W_MAP) + weight_tag("wmesh", W_MESH)
-            + std::string(PRESCRIBED_MESH_IDEAL ? "_pmesh" : "")
             + std::string(MESH_TEL_PASSIVE ? "_telpassive" : "")
             + weight_tag("approx", APPROX_ERROR_SCALE)
-            + std::string(REMESH_ONLY ? "_frozen" : "")
             + weight_tag("mel", MAX_EDGE_LENGTH / 100.0)
             + (MAP_DRIVEN_TEL ? ("_mdtel" + weight_tag("floor", MAP_TEL_FLOOR)) : "")
             + std::string(RELEASE_LANDMARKS ? "_rellm" : "")
-            + std::string(MOBIUS_FITTED_EMBEDDING_B ? "_mob" : "");
+            ;
     std::ofstream csv(output_root / ("metrics_" + suffix + ".csv"));
     csv << "config,stage,corr_mean,corr_median,corr_max,"
            "residual_mean,residual_mean_aw,residual_median,residual_median_aw,"
@@ -1217,7 +852,8 @@ void run()
     // write it with write_colored_ply_flat().
     ISM_INFO("Headless build: skipping the 8 renders. CSV, trace and OBJs are written.");
 #else
-    // --- Visualization: 2 renders per config = 8 total --------------------
+    // --- Visualization ----------------------------------------------------
+    // Render 0: the map-driven sizing field on mesh A, once, before everything else
     // Render 1: geometry + T wireframe, A | B (does T look sane, do triangles slide?)
     // Render 2: checkerboard transferred A -> B (sliding and shear are obvious here)
     // Landmarks are drawn into BOTH, not as a render of their own -- see LANDMARK_BALLS.
@@ -1256,6 +892,21 @@ void run()
         else
             view_texture_frontal_projection_input(_state, 0, _mesh_idx, TEXTURE_PROJECTION_DIR, TEXTURE_FACTOR, texture);
     };
+
+    // Render 0, shown FIRST: the map-driven sizing field on mesh A. It is the same field
+    // for every config (it depends only on mesh A, the prescribed jacobians and the
+    // settings, none of which differ), so it is drawn once rather than per config.
+    // Magenta = at the floor, white = at max_edge_length. The PLYs in <config>/
+    // sizing_field/ hold the same thing plus the two stages behind it, for
+    // tools/render_field.py.
+    if (MAP_DRIVEN_TEL && !states.empty() && !states[0].tels_input.empty())
+    {
+        auto s = screenshot_config(OPEN_VIEWER, screenshot_dir / "sizing_field.png", tg::ivec2(1920, 1080), true);
+        auto style = default_style();
+        auto v = gv::view();
+        view_vertex_field(states[0].meshes_input[0], states[0].tels_input[0],
+                          MAP_TEL_FLOOR, MAX_EDGE_LENGTH);
+    }
 
     for (int i = 0; i < (int)configs.size(); ++i)
     {

@@ -15,13 +15,6 @@
 namespace SurfaceMaps
 {
 
-/// How map_driven_target_edge_lengths turns the detected seam into a sizing field.
-enum class MapTelMethod
-{
-    HeatDiffusion,
-    GeodesicDijkstra,
-};
-
 struct AdaptiveTriangulationsSettings
 {
     // Schedule
@@ -31,19 +24,6 @@ struct AdaptiveTriangulationsSettings
     // Prescribed Jacobian mode
     bool use_prescribed_jacobian = false;
     bool prescribed_metric_form = true; // Metric form (V, sigma only, U ignored); false = full J* residual
-
-    /// Make E_mesh prescription-aware instead of merely down-weighting it.
-    ///
-    /// E_mesh compares each lifted T triangle to an ideal EQUILATERAL of side tel, once
-    /// per input mesh. Demanding equilateral on A *and* on B implies J is a rotation, so
-    /// E_mesh carries a hidden isometry prior that is mutually unsatisfiable with an
-    /// anisotropic prescription. With this on, the B-side ideal instead carries the
-    /// prescribed anisotropy (see prescribed_ideal_shape), so satisfying both terms
-    /// implies J ~ J* rather than J ~ rotation.
-    ///
-    /// Reduces EXACTLY to the old behaviour when J* = I, so A-on-A rows must stay
-    /// bit-identical. Requires use_prescribed_jacobian.
-    bool prescribed_mesh_ideal = false;
 
     // Weights
     double w_barrier = 1e-4;
@@ -116,19 +96,9 @@ struct AdaptiveTriangulationsSettings
     /// than that only resolves the seam's position, not its values.
     double map_tel_floor = 0.015;
 
-    /// How the seam is turned into a field. See map_driven_target_edge_lengths.
-    ///
-    /// HeatDiffusion (default): one short-time implicit heat step from the seam, band
-    ///   width set by map_tel_diffusion_length. Smooth, and its thickness is a LENGTH, so
-    ///   it does not change meaning when the input mesh is refined.
-    /// GeodesicDijkstra: the original. tel = floor + gradation * dist(seam), with the
-    ///   seam first dilated by map_tel_min_rings. Kept so the earlier measurements stay
-    ///   reproducible; map_tel_gradation and map_tel_min_rings apply only to this path.
-    MapTelMethod map_tel_method = MapTelMethod::HeatDiffusion;
-
     /// HeatDiffusion only. The diffusion LENGTH w; the solver runs one implicit step at
     /// t = w^2, so w is the distance over which the field falls off, in world units on
-    /// mesh A. This is the knob that replaces map_tel_min_rings: a ring count is a
+    /// mesh A. This is the knob that replaced the old ring count: a ring count is a
     /// resolution-dependent way of saying "thick enough to be sampled", while w says it
     /// in units that survive a refinement of the input.
     ///
@@ -137,26 +107,12 @@ struct AdaptiveTriangulationsSettings
     /// element, which is the finest thing the diffusion can represent.
     ///
     /// Measured on the L, band as a fraction of A's area: 2*h = 0.089 -> 39.6%,
-    /// w = 0.03 -> 19.1%, w = 0.015 -> 18.4%, and the old dilate-then-Dijkstra path
-    /// -> 45.4%. Note the saturation: below w ~ 0.03 the knob stops doing anything,
+    /// w = 0.03 -> 19.1%, w = 0.015 -> 18.4%. Note the saturation: below w ~ 0.03 the knob stops doing anything,
     /// because what is left is the DETECTOR's own footprint (125 of the L's 786 vertices
     /// are seam, pinned to the floor). On a shape whose prescription jumps across a sharp
     /// curve rather than the L's 101-face transition band, that floor is far lower and w
     /// controls the width throughout.
     double map_tel_diffusion_length = 0.0;
-
-    /// GeodesicDijkstra only. Gradation: tel grows as floor + g * distance-to-seam. A
-    /// size-per-length, so it is independent of input mesh resolution. 0.2-1.0 is the
-    /// usual meshing range; the cost is nearly flat in g (3-12% of face count from 0.25
-    /// to infinity), so there is no reason to tune it.
-    double map_tel_gradation = 0.5;
-
-    /// GeodesicDijkstra only. Rings the seam is dilated by before the gradation starts.
-    /// Needed because tel is read by a single centroid sample per T triangle, so a band
-    /// thinner than an element is invisible to it. 2 is the safe default; 1 is marginal
-    /// on a mesh as fine as the U. The HeatDiffusion path does not dilate -- the
-    /// diffusion itself is what widens the seam, which is the point of it.
-    int map_tel_min_rings = 2;
 
     /// Where to dump the three map-driven diagnostic PLYs (jump detector, diffused phi,
     /// resulting sizing field) on mesh A. Empty disables them. Written with
@@ -188,8 +144,6 @@ struct AdaptiveTriangulationsSettings
     /// conv_thresh_newton_decrement: that test runs AFTER the line search, so a step is
     /// already taken each round.
     bool remesh_only = false;
-
-    bool probe_symmetry = false;
 
     double hessian_projection_eps = 1e-9;
     double w_identity = 1e-9;
