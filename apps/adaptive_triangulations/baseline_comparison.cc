@@ -893,19 +893,35 @@ void run()
             view_texture_frontal_projection_input(_state, 0, _mesh_idx, TEXTURE_PROJECTION_DIR, TEXTURE_FACTOR, texture);
     };
 
-    // Render 0, shown FIRST: the map-driven sizing field on mesh A. It is the same field
-    // for every config (it depends only on mesh A, the prescribed jacobians and the
-    // settings, none of which differ), so it is drawn once rather than per config.
-    // Magenta = at the floor, white = at max_edge_length. The PLYs in <config>/
-    // sizing_field/ hold the same thing plus the two stages behind it, for
-    // tools/render_field.py.
+    // Render 0, shown FIRST: the sizing field on mesh A, map-driven alone | combined.
+    // Drawn once rather than per config, because it is the same field for every one of
+    // them (it depends only on mesh A, the prescribed jacobians and the settings).
+    //
+    // LEFT is phi, the diffused seam indicator on its own: white where the prescription
+    // jumps, magenta away from it. RIGHT is tels_input[0], which is phi already min()'d
+    // with the CURVATURE field, so on a shape like the L every chamfer is coloured there
+    // too -- that colouring is curvature, not prescription, and the left panel is the one
+    // to judge the map-driven field on.
+    //
+    // (The left panel still shows some crease colouring of its own, and that part IS the
+    // detector: sigma is measured in each face's own tangent frame, so a crease inside a
+    // stretched region gives a genuine sigma jump. Measured on the L, 54% of the detected
+    // seam edges sit on a crease, all of them at x >= 0.03, i.e. the stretched half.)
     if (MAP_DRIVEN_TEL && !states.empty() && !states[0].tels_input.empty())
     {
         auto s = screenshot_config(OPEN_VIEWER, screenshot_dir / "sizing_field.png", tg::ivec2(1920, 1080), true);
         auto style = default_style();
-        auto v = gv::view();
-        view_vertex_field(states[0].meshes_input[0], states[0].tels_input[0],
-                          MAP_TEL_FLOOR, MAX_EDGE_LENGTH);
+        auto g = gv::grid();
+        {
+            auto v = gv::view();
+            if (states[0].map_tel_phi.size_okay(states[0].meshes_input[0]))
+                view_vertex_field(states[0].meshes_input[0], states[0].map_tel_phi, 0.0, 1.0);
+        }
+        {
+            auto v = gv::view();
+            view_vertex_field(states[0].meshes_input[0], states[0].tels_input[0],
+                              MAP_TEL_FLOOR, MAX_EDGE_LENGTH);
+        }
     }
 
     for (int i = 0; i < (int)configs.size(); ++i)

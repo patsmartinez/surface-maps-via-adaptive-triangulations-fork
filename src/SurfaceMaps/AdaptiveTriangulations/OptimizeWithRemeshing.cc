@@ -90,6 +90,8 @@ void init_target_edge_lengths(
                     _settings.map_tel_diffusion_length,
                     n_seam_verts, &jump_field, &phi_field);
 
+        _map_state.map_tel_phi = phi_field;
+
         int n_lowered = 0;
         for (auto vh : _map_state.meshes_input[0].vertices())
         {

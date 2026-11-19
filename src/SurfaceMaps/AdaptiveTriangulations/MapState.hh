@@ -56,7 +56,8 @@ struct MapState
           maps_Tf_inputvs(_other.maps_Tf_inputvs),
           vertex_areas_input(_other.vertex_areas_input),
           meshes_embeddings_input(_other.meshes_embeddings_input),
-          prescribed_jacobians(_other.prescribed_jacobians)
+          prescribed_jacobians(_other.prescribed_jacobians),
+          map_tel_phi(_other.map_tel_phi)
     {
         compute_bsp_trees();
     }
@@ -95,6 +96,12 @@ struct MapState
     // Outer index: pair index (matching pairs_map_distortion).
     // Inner index: face index of the first mesh (A) in that pair.
     std::vector<ExternalProperty<FH, PrescribedJacobian>> prescribed_jacobians;
+
+    // The map-driven sizing field BEFORE it is min()'d into tels_input[0]: the diffused
+    // seam indicator phi in [0, 1] on mesh A. Kept so the field can be viewed on its own,
+    // since tels_input holds it already mixed with the curvature field and on the L the
+    // curvature field colours every chamfer. Empty unless settings.map_driven_tel ran.
+    ExternalProperty<VH, double> map_tel_phi;
 };
 
 // Returns a BarycentricPoint on target mesh.
