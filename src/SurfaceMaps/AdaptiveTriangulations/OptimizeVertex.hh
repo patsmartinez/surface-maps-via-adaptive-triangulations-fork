@@ -73,6 +73,25 @@ double eval_triangles(
         const AdaptiveTriangulationsSettings& _settings);
 
 
+/// Total objective over ALL of T, at the current state.
+///
+/// Built from eval_triangles over every face of T, so it is the same sum the optimizer
+/// minimizes and the same one remeshing judges operations against -- barrier,
+/// regularization, surface approximation, E_mesh and E_map. The landmark terms are not
+/// included; they are zero once the landmarks are released, and the landmark phase is the
+/// only place they are not.
+///
+/// Returns NaN before the first phase has run, when tels_input (the sizing field E_mesh
+/// is measured against) does not exist yet.
+///
+/// It is an extensive quantity: a sum over |F(T)| faces, so it grows with refinement and
+/// is only comparable across states with the same T. Divide by mesh_T.n_faces() to
+/// compare across resolutions.
+double total_energy(
+        const MapState& _map_state,
+        const AdaptiveTriangulationsSettings& _settings);
+
+
 /// Compute energy for list of triangles for n meshes.
 /// Also compute new assignment of n meshes vertices to these triangles.
 double eval_and_assign_triangles(

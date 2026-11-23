@@ -9,6 +9,8 @@
 
 #include <SurfaceMaps/AdaptiveTriangulations/OptimizeVertex.hh>
 
+#include <limits>
+
 #include <SurfaceMaps/AdaptiveTriangulations/OptimizeMapEnergies.hh>
 #include <SurfaceMaps/Misc/ConstantCurvatureGeometry.hh>
 #include <SurfaceMaps/AdaptiveTriangulations/Helpers.hh>
@@ -31,6 +33,36 @@ std::vector<SVH> collect_assigned_vertices(
 
     return vhs;
 }
+
+double total_energy(
+        const MapState& _map_state,
+        const AdaptiveTriangulationsSettings& _settings)
+{
+    const int n_meshes = (int)_map_state.meshes_input.size();
+
+    // The sizing field is built by init_target_edge_lengths, which runs at the start of
+    // each optimize_with_remeshing call -- so before the first phase there is none, and
+    // E_mesh is not defined yet. NaN rather than a guess, and rather than indexing an
+    // empty tels_input, which is a segfault.
+    // Every per-mesh property the energy reaches. tels_input is built by
+    // init_target_edge_lengths and vertex_areas_input inside optimize_with_remeshing, so
+    // before the first phase neither exists and E_mesh / E_approx are undefined.
+    if ((int)_map_state.tels_input.size() != n_meshes
+        || (int)_map_state.maps_Tf_inputvs.size() != n_meshes
+        || (int)_map_state.vertex_areas_input.size() != n_meshes)
+        return std::numeric_limits<double>::quiet_NaN();
+
+    std::vector<std::vector<Triangle>> tris(n_meshes);
+    for (int i = 0; i < n_meshes; ++i)
+    {
+        tris[i].reserve(_map_state.mesh_T.n_faces());
+        for (auto fh : _map_state.mesh_T.faces())
+            tris[i].emplace_back(fh, _map_state.mesh_T, _map_state.embeddings_T[i],
+                                 _map_state.maps_Tf_inputvs[i], _settings);
+    }
+    return eval_triangles(tris, _map_state, _settings);
+}
+
 
 double eval_triangles(
         const std::vector<std::vector<Triangle>>& _tris,

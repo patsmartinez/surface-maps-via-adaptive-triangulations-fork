@@ -46,6 +46,7 @@
 #include <SurfaceMaps/AdaptiveTriangulations/MapState.hh>
 #include <SurfaceMaps/AdaptiveTriangulations/PrescribedJacobianField.hh>
 #include <SurfaceMaps/AdaptiveTriangulations/OptimizeWithRemeshing.hh>
+#include <SurfaceMaps/AdaptiveTriangulations/OptimizeVertex.hh>
 #include <SurfaceMaps/AdaptiveTriangulations/OptimizeCoarseToFine.hh>
 #include <SurfaceMaps/AdaptiveTriangulations/InitSphereEmbeddings.hh>
 #include <SurfaceMaps/AdaptiveTriangulations/AssignVerticesToFaces.hh>
@@ -81,9 +82,41 @@ namespace SurfaceMaps
 // ---------------------------------------------------------------------------
 
 /// Mesh pair. Both meshes MUST share connectivity (corr metric and J* pair by index). See docs/baseline_comparison_notes.md#mesh_dir
+/// Only read when ALL_MODELS is off; tools/sweep.py patches these three.
 const std::string MESH_DIR = "meshes/l_shape";
 const std::string MESH_A   = "newL.obj";
 const std::string MESH_B   = "stretchedL.obj";
+
+/// One mesh pair to run. See docs/baseline_comparison_notes.md#all_models-models
+struct Model
+{
+    std::string name;   ///< short label, used in the log and the captions only
+    std::string dir;    ///< relative to DATA_PATH
+    std::string mesh_a;
+    std::string mesh_b;
+};
+
+/// Run every entry of MODELS back to back instead of just MESH_DIR/MESH_A/MESH_B.
+/// See docs/baseline_comparison_notes.md#all_models-models
+///
+/// Every model finishes, and every CSV is closed, BEFORE the first viewer window opens.
+/// The windows block, so rendering each model as it finishes would mean quitting at
+/// window 3 loses the later models' numbers entirely; this way they are already on disk.
+///
+/// tools/sweep.py patches this to false -- it drives one pair per build and relies on
+/// MESH_DIR/MESH_A/MESH_B.
+const bool ALL_MODELS = true;
+
+/// The four pairs that share connectivity and therefore have a valid J* and corr_err.
+/// Mirrors tools/sweep.py's MODELS so the two agree on what "the four models" means.
+/// The hand pair is NOT here: data/meshes/hand has 6400 vs 12184 faces, so it needs the
+/// J* input path before it can run at all.
+const std::vector<Model> MODELS = {
+    { "betterL", "meshes/l_shape", "betterL.obj", "betterLstretched.obj" },
+    { "L",       "meshes/l_shape", "newL.obj",    "stretchedL.obj"       },
+    { "U",       "meshes/u_shape", "u1.obj",      "u1stretch.obj"        },
+    { "sphere",  "meshes/sphere",  "sphere.obj",  "ellipse1.obj"         },
+};
 
 /// 16 is best measured; 32 over-constrains and collapses the prescribed gap to 1.03x. See docs/baseline_comparison_notes.md#n_fps_landmarks
 const int  N_FPS_LANDMARKS = 16;
@@ -113,6 +146,11 @@ const bool SELF_MAP_ONLY      = false;
 /// Run only the A-on-B configs, skipping the self-map pair. See docs/baseline_comparison_notes.md#stretched_only
 const bool STRETCHED_ONLY     = true;
 
+/// Drop the symmetric-Dirichlet arm and run only the prescribed energy. The baseline is
+/// settled, so a sweep that only varies model and resolution does not need to re-measure
+/// it; halves the runtime.
+const bool PRESCRIBED_ONLY    = true;
+
 /// Multiplier on both phases' approx_error. 1.0 is the paper's setting. See docs/baseline_comparison_notes.md#approx_error_scale
 const double APPROX_ERROR_SCALE = 1.0;
 
@@ -141,14 +179,14 @@ const bool   LANDMARK_BALLS         = true;
 const double LANDMARK_RADIUS_FACTOR = 0.015;
 
 /// Also refine T where the PRESCRIBED metric jumps, not only where the surface curves. See docs/baseline_comparison_notes.md#map_driven_tel
-const bool   MAP_DRIVEN_TEL    = true;
+const bool   MAP_DRIVEN_TEL    = false;
 const double MAP_TEL_FLOOR     = 0.015;
 
 /// Heat diffusion length w on mesh A (t = w^2). 0 = auto, max(2*FLOOR, mean edge). See docs/baseline_comparison_notes.md#map_tel_diffusion_length
 const double MAP_TEL_DIFFUSION_LENGTH = 0.0;
 
 /// Write the three sizing-field PLYs per config; render with tools/render_field.py. See docs/baseline_comparison_notes.md#map_tel_debug_ply
-const bool   MAP_TEL_DEBUG_PLY = true;
+const bool   MAP_TEL_DEBUG_PLY = false;
 
 
 // ---------------------------------------------------------------------------
@@ -404,10 +442,15 @@ int count_band_T_faces(
     return n;
 }
 
+/// _report_settings is a FIXED yardstick, not the live objective: every stage is scored
+/// with the same weights, so the energies are comparable down the column and across
+/// models. The optimizer's own objective changes between phases (w_barrier 1e-3 -> 1e-6,
+/// and approx_error), so its per-phase value is not comparable even with itself.
 void report(
         const MapState& _map_state,
         const std::string& _config_name,
         const std::string& _stage,
+        const AdaptiveTriangulationsSettings& _report_settings,
         std::ofstream& _csv)
 {
     double corr_mean, corr_median, corr_max;
@@ -453,12 +496,16 @@ void report(
              << " B " << ang_mean_B << "/" << ang_worst_B
              << (MAP_DRIVEN_TEL ? (" | band faces " + std::to_string(n_band_T)) : ""));
 
+    const double E = total_energy(_map_state, _report_settings);
+    const double nF_T = (double)_map_state.mesh_T.n_faces();
+
     _csv << _config_name << "," << _stage << ","
          << corr_mean << "," << corr_median << "," << corr_max << ","
          << res.mean << "," << res.mean_aw << ","
          << res.median << "," << res.median_aw << "," << res.p90 << "," << res.max << ","
          << res.frac_gt_0p1 << "," << res.frac_gt_0p1_aw << ","
          << res.area_part_aw << "," << res.shape_part_aw << ","
+         << E << "," << (nF_T > 0 ? E / nF_T : 0.0) << ","
          << res.n_faces << "," << _map_state.mesh_T.n_vertices() << ","
          << n_band_T << ","
          << drift_mean << "," << drift_max << ","
@@ -512,6 +559,7 @@ void trace_step(
         const fs::path& _output_dir,
         const std::string& _kind,
         const std::string& _label,
+        const AdaptiveTriangulationsSettings& _report_settings,
         int& _frame,
         std::ofstream& _csv)
 {
@@ -540,10 +588,14 @@ void trace_step(
 
     // Area-weighted only: T changes size constantly here, so the unweighted numbers
     // would not be comparable from one row to the next.
+    const double E = total_energy(_map_state, _report_settings);
+    const double nF_T = (double)_map_state.mesh_T.n_faces();
+
     _csv << _frame << "," << _kind << "," << _label << ","
          << corr_mean << "," << corr_median << ","
          << res.mean_aw << "," << res.area_part_aw << "," << res.shape_part_aw << ","
-         << res.frac_gt_0p1_aw << "," << res.n_faces << ","
+         << res.frac_gt_0p1_aw << "," << E << "," << (nF_T > 0 ? E / nF_T : 0.0) << ","
+         << res.n_faces << ","
          << _map_state.mesh_T.n_vertices() << ","
          << drift_mean << "," << drift_max << ","
          << ang_mean_A << "," << ang_worst_A << ","
@@ -565,6 +617,7 @@ void trace_step(
 // ---------------------------------------------------------------------------
 
 void run_config(
+        const Model& _model,
         const Config& _config,
         const fs::path& _output_root,
         std::ofstream& _csv,
@@ -573,16 +626,16 @@ void run_config(
         std::vector<MapState>& _out_states)
 {
     const std::string name = _config.name();
-    ISM_INFO("################ " << name << " ################");
+    ISM_INFO("################ " << _model.name << " / " << name << " ################");
 
     const fs::path output_dir = _output_root / name;
     fs::create_directories(output_dir);
 
     // A on A maps the mesh to itself: both inputs are the same file.
-    const fs::path mesh_path_A = DATA_PATH / MESH_DIR / MESH_A;
+    const fs::path mesh_path_A = DATA_PATH / _model.dir / _model.mesh_a;
     const fs::path mesh_path_B = (_config.pair_mode == PairMode::SelfMap)
             ? mesh_path_A
-            : DATA_PATH / MESH_DIR / MESH_B;
+            : DATA_PATH / _model.dir / _model.mesh_b;
 
     // --- Landmarks -------------------------------------------------------
     // Written into the OUTPUT dir (never into DATA_PATH). The two meshes share
@@ -670,7 +723,29 @@ void run_config(
 
     assign_vertices_to_T_faces(map_state);
 
-    report(map_state, name, "00_init", _csv);
+    // The fixed yardstick every energy in this run is scored with -- see report(). Built
+    // once, from the fine phase's weights, because that is what the final state was
+    // actually optimized under. w_map/w_mesh and the prescribed flags must match the run
+    // or the number would not describe this configuration at all.
+    AdaptiveTriangulationsSettings report_settings = fine_phase_settings(
+                default_fine_approx_error * APPROX_ERROR_SCALE, default_w_approx);
+    report_settings.use_prescribed_jacobian = (_config.energy_mode == EnergyMode::PrescribedMetric);
+    report_settings.mesh_tel_passive = MESH_TEL_PASSIVE;
+    report_settings.max_edge_length = std::min(report_settings.max_edge_length, MAX_EDGE_LENGTH);
+    report_settings.w_map = W_MAP;
+    report_settings.w_mesh = W_MESH;
+    report_settings.hard_landmark_constraints = false; // landmark terms are excluded anyway
+
+    // Build the sizing field up front, so 00_init has a defined energy too. Every phase
+    // calls init_target_edge_lengths itself and overwrites this, so it cannot leak into
+    // the run -- it only fills in the one row that would otherwise be NaN. With
+    // START_FROM_GROUND_TRUTH that row is the map at J == J*, i.e. the energy floor.
+    init_target_edge_lengths(map_state, report_settings);
+    if (map_state.vertex_areas_input.size() != map_state.meshes_input.size())
+        for (const auto& m : map_state.meshes_input)
+            map_state.vertex_areas_input.push_back(rel_vertex_areas(m));
+
+    report(map_state, name, "00_init", report_settings, _csv);
 
     // --- Per-iteration trace ----------------------------------------------
     // tracer(kind) builds a callback for one call site; the optimizer supplies the
@@ -684,7 +759,7 @@ void run_config(
         trace_csv.open(output_dir / "trace.csv");
         trace_csv << "frame,kind,label,corr_mean,corr_median,"
                      "residual_mean_aw,residual_area_aw,residual_shape_aw,"
-                     "residual_frac_gt_0p1_aw,n_faces_T,n_verts_T,"
+                     "residual_frac_gt_0p1_aw,energy,energy_per_face,n_faces_T,n_verts_T,"
                      "drift_mean_deg,drift_max_deg,"
                      "minang_mean_A,minang_worst_A,minang_mean_B,minang_worst_B\n";
     }
@@ -693,7 +768,8 @@ void run_config(
         return [&, _kind] (const std::string& _label)
         {
             if (TRACE_ITERATIONS)
-                trace_step(map_state, output_dir, _kind, _label, trace_frame, trace_csv);
+                trace_step(map_state, output_dir, _kind, _label, report_settings,
+                           trace_frame, trace_csv);
         };
     };
 
@@ -715,7 +791,7 @@ void run_config(
     // every upstream app.
     if (RELEASE_LANDMARKS)
         release_landmarks(map_state);
-    report(map_state, name, "01_landmark", _csv);
+    report(map_state, name, "01_landmark", report_settings, _csv);
 
     const bool prescribed = (_config.energy_mode == EnergyMode::PrescribedMetric);
 
@@ -740,7 +816,7 @@ void run_config(
         optimize_with_remeshing(map_state, settings, "",
                                 tracer("coarse_optim"), tracer("coarse_remesh"));
     }
-    report(map_state, name, "02_coarse", _csv);
+    report(map_state, name, "02_coarse", report_settings, _csv);
 
     {
         AdaptiveTriangulationsSettings settings = fine_phase_settings();
@@ -761,7 +837,7 @@ void run_config(
         optimize_with_remeshing(map_state, settings, "",
                                 tracer("fine_optim"), tracer("fine_remesh"));
     }
-    report(map_state, name, "03_final", _csv);
+    report(map_state, name, "03_final", report_settings, _csv);
 
     timer.stop();
     ISM_INFO("[" << name << "] runtime " << timer.seconds() << " s");
@@ -789,17 +865,26 @@ void run()
     // whenever present, so a shared root would silently feed one pair's embedding to the
     // other -- the same stale-cache trap that once turned START_FROM_GROUND_TRUTH into a
     // no-op and produced a plausible-looking but meaningless run.
-    const fs::path output_root =
-            OUTPUT_PATH / ("baseline_comparison_" + fs::path(MESH_DIR).filename().string());
-    fs::create_directories(output_root);
+    //
+    // The MESH FILE NAMES, not just the directory: l_shape holds two different pairs
+    // (newL/stretchedL and betterL/betterLstretched), and keying on the directory alone
+    // would hand the second pair the first one's cached embedding -- precisely the trap
+    // the paragraph above describes, left open because there used to be one pair per
+    // directory.
+    // So output_root is built per model, inside the loop below.
+
+    // With ALL_MODELS off this is the single MESH_DIR/MESH_A/MESH_B pair, so one code
+    // path serves both and the sweep driver only has to flip the flag.
+    const std::vector<Model> models = ALL_MODELS
+            ? MODELS
+            : std::vector<Model>{ { fs::path(MESH_A).stem().string(), MESH_DIR, MESH_A, MESH_B } };
 
 #if ISM_HAS_VIEWER
-    const fs::path screenshot_dir = output_root / "screenshots";
-    fs::create_directories(screenshot_dir);
     glow::SharedTexture2D texture = read_texture(DATA_PATH / "textures/checkerboard.png");
 #endif
 
-    // CSV of all metrics, one row per (config, stage)
+    // CSV of all metrics, one row per (config, stage). One file per model, under that
+    // model's own output_root; tools/collect.py aggregates them into sweep_summary.csv.
     const std::string suffix = "fps" + std::to_string(N_FPS_LANDMARKS)
             + std::string(START_FROM_GROUND_TRUTH ? "_gt" : "")
             + std::string(PRESCRIBED_IN_COARSE_PHASE ? "_pcoarse" : "")
@@ -810,17 +895,8 @@ void run()
             + (MAP_DRIVEN_TEL ? ("_mdtel" + weight_tag("floor", MAP_TEL_FLOOR)) : "")
             + std::string(RELEASE_LANDMARKS ? "_rellm" : "")
             ;
-    std::ofstream csv(output_root / ("metrics_" + suffix + ".csv"));
-    csv << "config,stage,corr_mean,corr_median,corr_max,"
-           "residual_mean,residual_mean_aw,residual_median,residual_median_aw,"
-           "residual_p90,residual_max,residual_frac_gt_0p1,residual_frac_gt_0p1_aw,"
-           "residual_area_aw,residual_shape_aw,"
-           "n_faces_T,n_verts_T,n_band_T,"
-           "drift_mean_deg,drift_max_deg,"
-           "minang_mean_A,minang_worst_A,minang_mean_B,minang_worst_B\n";
-
     ISM_ASSERT(!(SELF_MAP_ONLY && STRETCHED_ONLY)); // they exclude each other
-    const std::vector<Config> configs = SELF_MAP_ONLY
+    std::vector<Config> configs = SELF_MAP_ONLY
         ? std::vector<Config>{
             { PairMode::SelfMap,   EnergyMode::SymmetricDirichlet },
           }
@@ -835,14 +911,71 @@ void run()
             { PairMode::Stretched, EnergyMode::SymmetricDirichlet },
             { PairMode::Stretched, EnergyMode::PrescribedMetric   },
           };
+    if (PRESCRIBED_ONLY)
+    {
+        std::vector<Config> keep;
+        for (const auto& c : configs)
+            if (c.energy_mode == EnergyMode::PrescribedMetric)
+                keep.push_back(c);
+        ISM_ASSERT(!keep.empty()); // SELF_MAP_ONLY is dirichlet-only, so they conflict
+        configs = keep;
+    }
 
-    std::vector<TriMesh> lifted_As, lifted_Bs;
-    std::vector<MapState> states;
-    for (const auto& config : configs)
-        run_config(config, output_root, csv, lifted_As, lifted_Bs, states);
+    // Everything one model needs for its three renders, kept alive until the whole
+    // sweep has finished -- see ALL_MODELS for why the rendering waits for that.
+    struct ModelRun
+    {
+        Model model;
+        fs::path output_root;
+        fs::path screenshot_dir;
+        std::vector<TriMesh> lifted_As;
+        std::vector<TriMesh> lifted_Bs;
+        std::vector<MapState> states;
+    };
+    std::vector<ModelRun> runs;
+    // MapState declares a copy constructor, which suppresses the implicit move one, so
+    // a reallocation here would deep-copy every state. Reserve and it never happens.
+    runs.reserve(models.size());
 
-    csv.close();
-    ISM_INFO("Wrote metrics_" << suffix << ".csv");
+    for (const Model& model : models)
+    {
+        ISM_INFO("======== model " << model.name << " ("
+                 << model.mesh_a << " -> " << model.mesh_b << ") ========");
+
+        runs.push_back(ModelRun{});
+        ModelRun& rec = runs.back();
+        rec.model = model;
+        rec.output_root = OUTPUT_PATH
+                / ("baseline_comparison_" + fs::path(model.dir).filename().string()
+                   + "_" + fs::path(model.mesh_a).stem().string()
+                   + "_" + fs::path(model.mesh_b).stem().string());
+        fs::create_directories(rec.output_root);
+#if ISM_HAS_VIEWER
+        rec.screenshot_dir = rec.output_root / "screenshots";
+        fs::create_directories(rec.screenshot_dir);
+#endif
+
+        const fs::path csv_path = rec.output_root / ("metrics_" + suffix + ".csv");
+        std::ofstream csv(csv_path);
+        csv << "config,stage,corr_mean,corr_median,corr_max,"
+               "residual_mean,residual_mean_aw,residual_median,residual_median_aw,"
+               "residual_p90,residual_max,residual_frac_gt_0p1,residual_frac_gt_0p1_aw,"
+               "residual_area_aw,residual_shape_aw,"
+               "energy,energy_per_face,n_faces_T,n_verts_T,n_band_T,"
+               "drift_mean_deg,drift_max_deg,"
+               "minang_mean_A,minang_worst_A,minang_mean_B,minang_worst_B\n";
+
+        for (const auto& config : configs)
+            run_config(model, config, rec.output_root, csv, rec.lifted_As, rec.lifted_Bs, rec.states);
+
+        csv.close();
+        ISM_INFO("[" << model.name << "] wrote " << csv_path.string());
+    }
+
+    ISM_INFO("======== all " << runs.size() << " model(s) done ========");
+    for (const auto& rec : runs)
+        ISM_INFO("  " << rec.model.name << "  "
+                 << (rec.output_root / ("metrics_" + suffix + ".csv")).string());
 
 #if !ISM_HAS_VIEWER
     // Headless build (e.g. Apple Silicon): macOS caps desktop OpenGL at 4.1 and glow
@@ -850,13 +983,21 @@ void run()
     // lifted-T OBJs are all written exactly as above; only the 8 renders are missing.
     // To inspect a per-face field without a window, colour it with linear_colors() and
     // write it with write_colored_ply_flat().
-    ISM_INFO("Headless build: skipping the 8 renders. CSV, trace and OBJs are written.");
+    ISM_INFO("Headless build: skipping the renders (3 per model). CSV, trace and OBJs "
+             "are written.");
 #else
     // --- Visualization ----------------------------------------------------
-    // Render 0: the map-driven sizing field on mesh A, once, before everything else
-    // Render 1: geometry + T wireframe, A | B (does T look sane, do triangles slide?)
-    // Render 2: checkerboard transferred A -> B (sliding and shear are obvious here)
-    // Landmarks are drawn into BOTH, not as a render of their own -- see LANDMARK_BALLS.
+    // THREE windows per model, in this order, all of them side-by-side pairs:
+    //   Render 0: the sizing fields on mesh A, map-driven (phi) | combined (tels_input)
+    //   Render 1: geometry + T wireframe, A | B (does T look sane, do triangles slide?)
+    //   Render 2: checkerboard transferred A -> B (sliding and shear are obvious here)
+    // Landmarks are drawn into 1 and 2, not as a render of their own -- see
+    // LANDMARK_BALLS. Each window blocks until closed, and closing it opens the next.
+    //
+    // So the window count is 3 x models x configs. With the settled setup --
+    // STRETCHED_ONLY and PRESCRIBED_ONLY both on, which leaves exactly one config -- the
+    // four MODELS give 12 windows, grouped three at a time per model. Every panel is
+    // captioned with the model name, because by window 7 you will not remember.
     //
     // overlay_landmarks() and textured_view() add renderables to whichever gv::view() is
     // currently open, so both have to be called from inside one.
@@ -893,65 +1034,104 @@ void run()
             view_texture_frontal_projection_input(_state, 0, _mesh_idx, TEXTURE_PROJECTION_DIR, TEXTURE_FACTOR, texture);
     };
 
-    // Render 0, shown FIRST: the sizing field on mesh A, map-driven alone | combined.
-    // Drawn once rather than per config, because it is the same field for every one of
-    // them (it depends only on mesh A, the prescribed jacobians and the settings).
+    // phi for the LEFT panel of render 0. Recomputed here instead of read out of
+    // map_tel_phi, so the panel is populated whatever MAP_DRIVEN_TEL was: with the flag
+    // off nothing ever fills map_tel_phi. This is a pure function of mesh A and J*, runs
+    // after every report() and every write, and touches no part of the map state -- it
+    // cannot move the numbers that were just measured. Returns the field the run really
+    // used when there is one, so a MAP_DRIVEN_TEL run still shows its own field.
     //
-    // LEFT is phi, the diffused seam indicator on its own: white where the prescription
-    // jumps, magenta away from it. RIGHT is tels_input[0], which is phi already min()'d
-    // with the CURVATURE field, so on a shape like the L every chamfer is coloured there
-    // too -- that colouring is curvature, not prescription, and the left panel is the one
-    // to judge the map-driven field on.
-    //
-    // (The left panel still shows some crease colouring of its own, and that part IS the
-    // detector: sigma is measured in each face's own tangent frame, so a crease inside a
-    // stretched region gives a genuine sigma jump. Measured on the L, 54% of the detected
-    // seam edges sit on a crease, all of them at x >= 0.03, i.e. the stretched half.)
-    if (MAP_DRIVEN_TEL && !states.empty() && !states[0].tels_input.empty())
+    // The jump threshold is the settings default; the app never overrides it.
+    auto phi_field_for = [&] (const MapState& _state)
     {
-        auto s = screenshot_config(OPEN_VIEWER, screenshot_dir / "sizing_field.png", tg::ivec2(1920, 1080), true);
-        auto style = default_style();
-        auto g = gv::grid();
-        {
-            auto v = gv::view();
-            if (states[0].map_tel_phi.size_okay(states[0].meshes_input[0]))
-                view_vertex_field(states[0].meshes_input[0], states[0].map_tel_phi, 0.0, 1.0);
-        }
-        {
-            auto v = gv::view();
-            view_vertex_field(states[0].meshes_input[0], states[0].tels_input[0],
-                              MAP_TEL_FLOOR, MAX_EDGE_LENGTH);
-        }
-    }
+        ExternalProperty<VH, double> phi;
+        if (_state.meshes_input.empty() || _state.prescribed_jacobians.empty())
+            return phi; // dirichlet config: no prescription, so no seam to find
+        if (_state.map_tel_phi.size_okay(_state.meshes_input[0]))
+            return _state.map_tel_phi;
 
-    for (int i = 0; i < (int)configs.size(); ++i)
+        int n_seam_verts = 0;
+        const AdaptiveTriangulationsSettings defaults;
+        map_driven_target_edge_lengths(
+                    _state.meshes_input[0], _state.prescribed_jacobians[0],
+                    defaults.map_tel_jump_thresh, MAP_TEL_FLOOR, MAX_EDGE_LENGTH,
+                    MAP_TEL_DIFFUSION_LENGTH, n_seam_verts, nullptr, &phi);
+        return phi;
+    };
+
+    for (const ModelRun& rec : runs)
     {
-        const std::string name = configs[i].name();
-        const TriMesh* const lifted[2] = { &lifted_As[i], &lifted_Bs[i] };
-
+        for (int i = 0; i < (int)configs.size(); ++i)
         {
-            auto s = screenshot_config(OPEN_VIEWER, screenshot_dir / (name + "_wire.png"), tg::ivec2(1920, 1080), true);
-            auto style = default_style();
-            auto g = gv::grid();
-            for (int m = 0; m < 2; ++m)
+            const std::string name = configs[i].name();
+            const std::string tag = rec.model.name + " / " + name;
+            const TriMesh* const lifted[2] = { &rec.lifted_As[i], &rec.lifted_Bs[i] };
+            const MapState& state = rec.states[i];
+
+            // Render 0: the sizing field on mesh A, map-driven alone | combined.
+            //
+            // LEFT is phi, the diffused seam indicator on its own: white where the
+            // prescription jumps, magenta away from it. RIGHT is tels_input[0], i.e. the
+            // field the remesher actually read, which is phi already min()'d with the
+            // CURVATURE field -- so on a shape like the L every chamfer is coloured
+            // there too. That colouring is curvature, not prescription, and the left
+            // panel is the one to judge the map-driven field on.
+            //
+            // (The left panel still shows some crease colouring of its own, and that
+            // part IS the detector: sigma is measured in each face's own tangent frame,
+            // so a crease inside a stretched region gives a genuine sigma jump. Measured
+            // on the L, 54% of the detected seam edges sit on a crease, all of them at
+            // x >= 0.03, i.e. the stretched half.)
+            if (!state.meshes_input.empty() && !state.tels_input.empty())
             {
-                auto v = gv::view();
-                view_mesh(states[i].meshes_input[m], Color(0.8, 0.8, 0.8, 0.5));
-                view_mesh(*lifted[m], Color(1.0, 1.0, 1.0, 0.8));
-                view_wireframe(*lifted[m], m == 0 ? MAGENTA : TEAL, WidthScreen(0.5));
-                overlay_landmarks(states[i], *lifted[m], m);
+                auto s = screenshot_config(OPEN_VIEWER, rec.screenshot_dir / (name + "_sizing_field.png"), tg::ivec2(1920, 1080), true);
+                auto style = default_style();
+                auto g = gv::grid();
+                const auto phi = phi_field_for(state);
+                {
+                    auto v = gv::view();
+                    view_caption(tag + " : phi (map-driven)");
+                    if (phi.size_okay(state.meshes_input[0]))
+                        view_vertex_field(state.meshes_input[0], phi, 0.0, 1.0);
+                    else
+                        view_mesh(state.meshes_input[0], Color(0.8, 0.8, 0.8, 1.0));
+                }
+                {
+                    auto v = gv::view();
+                    view_caption(tag + " : tel (combined)");
+                    view_vertex_field(state.meshes_input[0], state.tels_input[0],
+                                      MAP_TEL_FLOOR, MAX_EDGE_LENGTH);
+                }
             }
-        }
 
-        {
-            auto s = screenshot_config(OPEN_VIEWER, screenshot_dir / (name + "_texture.png"), tg::ivec2(1920, 1080), true);
-            auto style = default_style();
-            auto g = gv::grid();
-            for (int m = 0; m < 2; ++m)
+            // Render 1: the triangulation, lifted onto A | lifted onto B.
             {
-                auto v = gv::view();
-                textured_view(states[i], m);
-                overlay_landmarks(states[i], *lifted[m], m);
+                auto s = screenshot_config(OPEN_VIEWER, rec.screenshot_dir / (name + "_wire.png"), tg::ivec2(1920, 1080), true);
+                auto style = default_style();
+                auto g = gv::grid();
+                for (int m = 0; m < 2; ++m)
+                {
+                    auto v = gv::view();
+                    view_caption(tag + (m == 0 ? " : T on A" : " : T on B"));
+                    view_mesh(state.meshes_input[m], Color(0.8, 0.8, 0.8, 0.5));
+                    view_mesh(*lifted[m], Color(1.0, 1.0, 1.0, 0.8));
+                    view_wireframe(*lifted[m], m == 0 ? MAGENTA : TEAL, WidthScreen(0.5));
+                    overlay_landmarks(state, *lifted[m], m);
+                }
+            }
+
+            // Render 2: the checkerboard carried across the map, A | B.
+            {
+                auto s = screenshot_config(OPEN_VIEWER, rec.screenshot_dir / (name + "_texture.png"), tg::ivec2(1920, 1080), true);
+                auto style = default_style();
+                auto g = gv::grid();
+                for (int m = 0; m < 2; ++m)
+                {
+                    auto v = gv::view();
+                    view_caption(tag + (m == 0 ? " : texture A" : " : texture B"));
+                    textured_view(state, m);
+                    overlay_landmarks(state, *lifted[m], m);
+                }
             }
         }
     }
