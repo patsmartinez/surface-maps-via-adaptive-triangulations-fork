@@ -116,6 +116,7 @@ const std::vector<Model> MODELS = {
     { "L",       "meshes/l_shape", "newL.obj",    "stretchedL.obj"       },
     { "U",       "meshes/u_shape", "u1.obj",      "u1stretch.obj"        },
     { "sphere",  "meshes/sphere",  "sphere.obj",  "ellipse1.obj"         },
+    { "cube",    "meshes/cube",    "smoothCube.obj", "smoothCubeDef.obj"  },
 };
 
 /// 16 is best measured; 32 over-constrains and collapses the prescribed gap to 1.03x. See docs/baseline_comparison_notes.md#n_fps_landmarks
