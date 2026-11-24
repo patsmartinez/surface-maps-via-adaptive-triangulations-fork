@@ -179,7 +179,7 @@ const bool   LANDMARK_BALLS         = true;
 const double LANDMARK_RADIUS_FACTOR = 0.015;
 
 /// Also refine T where the PRESCRIBED metric jumps, not only where the surface curves. See docs/baseline_comparison_notes.md#map_driven_tel
-const bool   MAP_DRIVEN_TEL    = false;
+const bool   MAP_DRIVEN_TEL    = true;
 const double MAP_TEL_FLOOR     = 0.015;
 
 /// Heat diffusion length w on mesh A (t = w^2). 0 = auto, max(2*FLOOR, mean edge). See docs/baseline_comparison_notes.md#map_tel_diffusion_length
@@ -1024,11 +1024,11 @@ void run()
 
     // The TEXTURE_SOURCE switch, in one place instead of twice. See the TexSource enum
     // for what the three schemes cost.
-    auto textured_view = [&] (const MapState& _state, const int _mesh_idx)
+    auto textured_view = [&] (const MapState& _state, const int _mesh_idx, const TexSource _src)
     {
-        if (TEXTURE_SOURCE == TexSource::Triplanar)
+        if (_src == TexSource::Triplanar)
             view_texture_triplanar_input(_state, 0, _mesh_idx, TEXTURE_FACTOR, texture);
-        else if (TEXTURE_SOURCE == TexSource::Sphere)
+        else if (_src == TexSource::Sphere)
             view_texture_sphere_embedding_input(_state, 0, _mesh_idx, TEXTURE_FACTOR, texture);
         else
             view_texture_frontal_projection_input(_state, 0, _mesh_idx, TEXTURE_PROJECTION_DIR, TEXTURE_FACTOR, texture);
@@ -1129,7 +1129,12 @@ void run()
                 {
                     auto v = gv::view();
                     view_caption(tag + (m == 0 ? " : texture A" : " : texture B"));
-                    textured_view(state, m);
+                    // Sphere/ellipse gets the sphere-embedding transfer: it HAS a
+                    // natural spherical parameterization, and triplanar seams across a
+                    // smooth closed surface are pure artifact. Keyed on the MODELS name
+                    // so it follows that pair wherever it sits in the list.
+                    textured_view(state, m, rec.model.name == "sphere"
+                                  ? TexSource::Sphere : TEXTURE_SOURCE);
                     overlay_landmarks(state, *lifted[m], m);
                 }
             }
