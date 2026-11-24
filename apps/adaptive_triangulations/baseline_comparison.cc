@@ -1125,7 +1125,7 @@ void run()
                 auto s = screenshot_config(OPEN_VIEWER, rec.screenshot_dir / (name + "_texture.png"), tg::ivec2(1920, 1080), true);
                 auto style = default_style();
                 auto g = gv::grid();
-                for (int m = 0; m < 2; ++m)
+                for (int m = 0; m < 1; ++m)
                 {
                     auto v = gv::view();
                     view_caption(tag + (m == 0 ? " : texture A" : " : texture B"));
